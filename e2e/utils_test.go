@@ -15,18 +15,26 @@ import (
 
 	"github.com/gluster/glusterd2/pkg/api"
 	"github.com/gluster/glusterd2/pkg/restclient"
-	"gopkg.in/yaml.v2"
+
+	toml "github.com/pelletier/go-toml"
 )
 
 type gdProcess struct {
 	Cmd           *exec.Cmd
-	ClientAddress string `yaml:"clientaddress"`
-	PeerAddress   string `yaml:"peeraddress"`
-	Workdir       string `yaml:"workdir"`
+	ClientAddress string `toml:"clientaddress"`
+	PeerAddress   string `toml:"peeraddress"`
+	Workdir       string `toml:"workdir"`
 	uuid          string
 }
 
 func (g *gdProcess) Stop() error {
+	g.Cmd.Process.Signal(os.Interrupt) // try shutting down gracefully
+	time.Sleep(500 * time.Millisecond)
+	if g.IsRunning() {
+		time.Sleep(1 * time.Second)
+	} else {
+		return nil
+	}
 	return g.Cmd.Process.Kill()
 }
 
@@ -54,11 +62,16 @@ func (g *gdProcess) PeerID() string {
 		return g.uuid
 	}
 
-	ubytes, err := ioutil.ReadFile(path.Join(g.Workdir, "uuid"))
+	// Endpoint doesn't matter here. All responses include a
+	// X-Gluster-Node-Id response header.
+	endpoint := fmt.Sprintf("http://%s/version", g.ClientAddress)
+	resp, err := http.Get(endpoint)
 	if err != nil {
 		return ""
 	}
-	g.uuid = string(ubytes)
+	defer resp.Body.Close()
+
+	g.uuid = resp.Header.Get("X-Gluster-Node-Id")
 	return g.uuid
 }
 
@@ -71,7 +84,7 @@ func (g *gdProcess) IsRestServerUp() bool {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode/100 == 5 {
 		return false
 	}
 
@@ -86,7 +99,7 @@ func spawnGlusterd(configFilePath string, cleanStart bool) (*gdProcess, error) {
 	}
 
 	g := gdProcess{}
-	if err = yaml.Unmarshal(fContent, &g); err != nil {
+	if err = toml.Unmarshal(fContent, &g); err != nil {
 		return nil, err
 	}
 
@@ -184,5 +197,5 @@ func teardownCluster(gds []*gdProcess) error {
 }
 
 func initRestclient(clientAddress string) *restclient.Client {
-	return restclient.New("http://"+clientAddress, "", "")
+	return restclient.New("http://"+clientAddress, "", "", "", false)
 }

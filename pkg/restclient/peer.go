@@ -9,13 +9,13 @@ import (
 )
 
 // PeerProbe adds a peer to the Cluster
-func (c *Client) PeerProbe(host string) (api.Peer, error) {
+func (c *Client) PeerProbe(host string) (api.PeerAddResp, error) {
 
 	peerAddReq := api.PeerAddReq{
 		Addresses: []string{host},
 	}
 
-	var resp api.Peer
+	var resp api.PeerAddResp
 	err := c.post("/v1/peers", peerAddReq, http.StatusCreated, &resp)
 	return resp, err
 }
@@ -32,7 +32,7 @@ func (c *Client) PeerDetach(host string) error {
 
 	// Find Peer ID using available information
 	for _, p := range peers {
-		for _, h := range p.Addresses {
+		for _, h := range p.PeerAddresses {
 			if h == host {
 				peerID = p.ID.String()
 				break
@@ -58,8 +58,8 @@ func (c *Client) PeerDetachByID(peerid string) error {
 }
 
 // Peers gets list of Gluster Peers
-func (c *Client) Peers() ([]api.Peer, error) {
-	var peers []api.Peer
+func (c *Client) Peers() (api.PeerListResp, error) {
+	var peers api.PeerListResp
 	err := c.get("/v1/peers", nil, http.StatusOK, &peers)
 	return peers, err
 }

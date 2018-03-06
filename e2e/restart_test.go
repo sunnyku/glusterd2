@@ -13,7 +13,7 @@ import (
 func TestRestart(t *testing.T) {
 	r := require.New(t)
 
-	gd, err := spawnGlusterd("./config/1.yaml", true)
+	gd, err := spawnGlusterd("./config/1.toml", true)
 	r.Nil(err)
 	r.True(gd.IsRunning())
 
@@ -25,8 +25,13 @@ func TestRestart(t *testing.T) {
 
 	createReq := api.VolCreateReq{
 		Name: "vol1",
-		Bricks: []string{
-			gd.PeerAddress + ":" + dir,
+		Subvols: []api.SubvolReq{
+			{
+				Type: "distribute",
+				Bricks: []api.BrickReq{
+					{NodeID: gd.PeerID(), Path: dir},
+				},
+			},
 		},
 		Force: true,
 	}
@@ -37,7 +42,7 @@ func TestRestart(t *testing.T) {
 
 	r.Nil(gd.Stop())
 
-	gd, err = spawnGlusterd("./config/1.yaml", false)
+	gd, err = spawnGlusterd("./config/1.toml", false)
 	r.Nil(err)
 	r.True(gd.IsRunning())
 
@@ -46,9 +51,10 @@ func TestRestart(t *testing.T) {
 	r.Nil(gd.Stop())
 }
 
-func getVols(gd *gdProcess, r *require.Assertions) api.VolList {
+func getVols(gd *gdProcess, r *require.Assertions) api.VolumeListResp {
 	client := initRestclient(gd.ClientAddress)
-	vols, err := client.Volumes()
+	volname := ""
+	vols, err := client.Volumes(volname)
 	r.Nil(err)
 	return vols
 }
