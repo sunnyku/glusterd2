@@ -7,12 +7,15 @@ import (
 	"github.com/gluster/glusterd2/glusterd2/servers/peerrpc"
 	"github.com/gluster/glusterd2/glusterd2/store"
 	"github.com/gluster/glusterd2/glusterd2/volume"
+	"github.com/gluster/glusterd2/pkg/utils"
 	"github.com/pborman/uuid"
 
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
+
+var mutex = &utils.MutexWithTry{}
 
 // PeerService implements the PeerService gRPC service
 type PeerService int
@@ -31,6 +34,13 @@ func (p *PeerService) Join(ctx context.Context, req *JoinReq) (*JoinRsp, error) 
 	logger := log.WithFields(log.Fields{
 		"remotepeer":    req.PeerID,
 		"remotecluster": req.ClusterID})
+
+	if mutex.TryLock() {
+		defer mutex.Unlock()
+	} else {
+		logger.Info("rejecting join request, already processing another join/leave request")
+		return &JoinRsp{"", int32(ErrAnotherReqInProgress)}, nil
+	}
 
 	logger.Info("handling new incoming join cluster request")
 
@@ -84,6 +94,13 @@ func (p *PeerService) Join(ctx context.Context, req *JoinReq) (*JoinRsp, error) 
 // Leave makes the peer leave its current cluster, and restart as a single node cluster
 func (p *PeerService) Leave(ctx context.Context, req *LeaveReq) (*LeaveRsp, error) {
 	logger := log.WithField("remotepeer", req.PeerID)
+
+	if mutex.TryLock() {
+		defer mutex.Unlock()
+	} else {
+		logger.Info("rejecting leave request, already processing another join/leave request")
+		return &LeaveRsp{int32(ErrAnotherReqInProgress)}, nil
+	}
 
 	logger.Info("handling incoming leave cluster request")
 
@@ -140,11 +157,23 @@ func ReconfigureStore(c *StoreConfig) error {
 	// Destroy the current store first
 	log.Debug("destroying current store")
 
-	// Stop global events listener
-	events.StopGlobal()
+	// Stop events framework
+	events.Stop()
 
-	store.Destroy()
-	// TODO: Also need to destroy any old files in localstatedir (eg. volfiles)
+	// do not delete cluster namespace if this is not a loner node
+	var deleteNamespace bool
+	peers, err := peer.GetPeers()
+	if err != nil {
+		log.WithError(err).Error("failed to list peers during store reconfigure")
+		return err
+	}
+	if len(peers) == 0 {
+		// the peer entry for this node was removed from the store
+		// by the node which received the peer removal request
+		deleteNamespace = true
+	}
+
+	store.Destroy(deleteNamespace)
 
 	// Restart the store with received configuration
 	cfg := store.GetConfig()
@@ -153,7 +182,7 @@ func ReconfigureStore(c *StoreConfig) error {
 	if err := store.Init(cfg); err != nil {
 		log.WithError(err).WithField("endpoints", cfg.Endpoints).Error("failed to restart store with new endpoints")
 		// Restart store with default config
-		defer restartDefaultStore(false)
+		defer restartDefaultStore(false, deleteNamespace)
 		return err
 	}
 	log.WithField("endpoints", cfg.Endpoints).Debug("store restarted with new endpoints")
@@ -162,7 +191,7 @@ func ReconfigureStore(c *StoreConfig) error {
 	if err := cfg.Save(); err != nil {
 		log.WithError(err).Error("failed to save new store configs")
 		// Destroy newly started store and restart with default config
-		defer restartDefaultStore(true)
+		defer restartDefaultStore(true, deleteNamespace)
 		return err
 	}
 	log.Debug("saved new store config")
@@ -171,20 +200,20 @@ func ReconfigureStore(c *StoreConfig) error {
 	if err := peer.AddSelfDetails(); err != nil {
 		log.WithError(err).Error("failed to add self to peer list")
 		// Destroy newly started store and restart with default config
-		defer restartDefaultStore(true)
+		defer restartDefaultStore(true, deleteNamespace)
 		return err
 	}
 	log.Debug("added details of self to store")
 
-	// Now that new store is up, start global events listener
-	events.StartGlobal()
+	// Now that new store is up, start events framework
+	events.Start()
 
 	return nil
 }
 
-func restartDefaultStore(destroy bool) {
+func restartDefaultStore(destroy bool, deleteNamespace bool) {
 	if destroy {
-		store.Destroy()
+		store.Destroy(deleteNamespace)
 	}
 	store.Init(nil)
 	peer.AddSelfDetails()

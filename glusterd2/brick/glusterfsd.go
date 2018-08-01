@@ -1,7 +1,7 @@
 package brick
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -17,6 +17,7 @@ import (
 	"github.com/gluster/glusterd2/glusterd2/pmap"
 	"github.com/gluster/glusterd2/pkg/api"
 	"github.com/gluster/glusterd2/pkg/utils"
+	log "github.com/sirupsen/logrus"
 
 	config "github.com/spf13/viper"
 )
@@ -29,7 +30,7 @@ const (
 type Glusterfsd struct {
 	// Externally consumable using methods of Glusterfsd interface
 	binarypath     string
-	args           string
+	args           []string
 	socketfilepath string
 	pidfilepath    string
 
@@ -48,7 +49,11 @@ func (b *Glusterfsd) Path() string {
 }
 
 // Args returns arguments to be passed to brick process during spawn.
-func (b *Glusterfsd) Args() string {
+func (b *Glusterfsd) Args() []string {
+
+	if b.args != nil {
+		return b.args
+	}
 
 	brickPathWithoutSlashes := strings.Trim(strings.Replace(b.brickinfo.Path, "/", "-", -1), "-")
 
@@ -63,19 +68,22 @@ func (b *Glusterfsd) Args() string {
 		shost = "127.0.0.1"
 	}
 
-	var buffer bytes.Buffer
-	buffer.WriteString(fmt.Sprintf(" --volfile-server %s", shost))
-	buffer.WriteString(fmt.Sprintf(" --volfile-server-port %s", sport))
-	buffer.WriteString(fmt.Sprintf(" --volfile-id %s", volFileID))
-	buffer.WriteString(fmt.Sprintf(" -p %s", b.PidFile()))
-	buffer.WriteString(fmt.Sprintf(" -S %s", b.SocketFile()))
-	buffer.WriteString(fmt.Sprintf(" --brick-name %s", b.brickinfo.Path))
-	buffer.WriteString(fmt.Sprintf(" --brick-port %s", brickPort))
-	buffer.WriteString(fmt.Sprintf(" -l %s", logFile))
-	buffer.WriteString(fmt.Sprintf(" --xlator-option *-posix.glusterd-uuid=%s", gdctx.MyUUID))
-	buffer.WriteString(fmt.Sprintf(" --xlator-option %s-server.transport.socket.listen-port=%s", b.brickinfo.VolumeName, brickPort))
+	b.args = []string{}
+	b.args = append(b.args, "--volfile-server", shost)
+	b.args = append(b.args, "--volfile-server-port", sport)
+	b.args = append(b.args, "--volfile-id", volFileID)
+	b.args = append(b.args, "-p", b.PidFile())
+	b.args = append(b.args, "-S", b.SocketFile())
+	b.args = append(b.args, "--brick-name", b.brickinfo.Path)
+	b.args = append(b.args, "--brick-port", brickPort)
+	b.args = append(b.args, "-l", logFile)
+	b.args = append(b.args,
+		"--xlator-option",
+		fmt.Sprintf("*-posix.glusterd-uuid=%s", gdctx.MyUUID))
+	b.args = append(b.args,
+		"--xlator-option",
+		fmt.Sprintf("%s-server.transport.socket.listen-port=%s", b.brickinfo.VolumeName, brickPort))
 
-	b.args = buffer.String()
 	return b.args
 }
 
@@ -92,13 +100,13 @@ func (b *Glusterfsd) SocketFile() string {
 	// Example: /var/lib/glusterd/vols/<vol-name>/run/<host-name>-<brick-path>
 	brickPathWithoutSlashes := strings.Trim(strings.Replace(b.brickinfo.Path, "/", "-", -1), "-")
 	// FIXME: The brick can no longer clean this up on clean shut down
-	fakeSockFileName := fmt.Sprintf("%s-%s", b.brickinfo.NodeID.String(), brickPathWithoutSlashes)
+	fakeSockFileName := fmt.Sprintf("%s-%s", b.brickinfo.PeerID.String(), brickPathWithoutSlashes)
 	volumedir := utils.GetVolumeDir(b.brickinfo.VolumeName)
 	fakeSockFilePath := path.Join(volumedir, "run", fakeSockFileName)
 
 	// Then xxhash of the above path shall be the name of socket file.
 	// Example: /var/run/gluster/<xxhash-hash>.socket
-	glusterdSockDir := path.Join(config.GetString("rundir"), "gluster")
+	glusterdSockDir := config.GetString("rundir")
 	b.socketfilepath = fmt.Sprintf("%s/%x.socket", glusterdSockDir, xxhash.Sum64String(fakeSockFilePath))
 
 	return b.socketfilepath
@@ -111,11 +119,10 @@ func (b *Glusterfsd) PidFile() string {
 		return b.pidfilepath
 	}
 
-	rundir := config.GetString("rundir")
 	brickPathWithoutSlashes := strings.Trim(strings.Replace(b.brickinfo.Path, "/", "-", -1), "-")
 	// FIXME: The brick can no longer clean this up on clean shut down
-	pidfilename := fmt.Sprintf("%s-%s.pid", b.brickinfo.NodeID.String(), brickPathWithoutSlashes)
-	b.pidfilepath = path.Join(rundir, "gluster", pidfilename)
+	pidfilename := fmt.Sprintf("%s-%s.pid", b.brickinfo.PeerID.String(), brickPathWithoutSlashes)
+	b.pidfilepath = path.Join(config.GetString("rundir"), pidfilename)
 
 	return b.pidfilepath
 }
@@ -164,15 +171,18 @@ func errorContainsErrno(err error, errno syscall.Errno) bool {
 // These functions are used in vol-create, vol-expand and vol-shrink (TBD)
 
 //StartBrick starts glusterfsd process
-func (b Brickinfo) StartBrick() error {
-
-	brickDaemon, err := NewGlusterfsd(b)
-	if err != nil {
-		return err
-	}
+func (b Brickinfo) StartBrick(logger log.FieldLogger) error {
 
 	for i := 0; i < BrickStartMaxRetries; i++ {
-		err = daemon.Start(brickDaemon, true)
+
+		// creating a new instance everytime ensures that the call to
+		// brickDaemon.Args() will get us a new port each time
+		brickDaemon, err := NewGlusterfsd(b)
+		if err != nil {
+			return err
+		}
+
+		err = daemon.Start(brickDaemon, true, logger)
 		if err != nil {
 			if errorContainsErrno(err, syscall.EADDRINUSE) || errorContainsErrno(err, anotherEADDRINUSE) {
 				// Retry iff brick failed to start because of port being in use.
@@ -189,15 +199,59 @@ func (b Brickinfo) StartBrick() error {
 	return nil
 }
 
-//StopBrick will stop glusterfsd process
-func (b Brickinfo) StopBrick() error {
+//TerminateBrick will stop glusterfsd process
+func (b Brickinfo) TerminateBrick() error {
 
 	brickDaemon, err := NewGlusterfsd(b)
 	if err != nil {
 		return err
 	}
 
-	return daemon.Stop(brickDaemon, true)
+	log.WithFields(log.Fields{
+		"volume": b.VolumeName, "brick": b.String()}).Info("Stopping brick")
+
+	client, err := daemon.GetRPCClient(brickDaemon)
+	if err != nil {
+		log.WithError(err).WithField(
+			"brick", b.String()).Error("failed to connect to brick")
+		return err
+	}
+
+	req := &GfBrickOpReq{
+		Name: b.Path,
+		Op:   int(OpBrickTerminate),
+	}
+	var rsp GfBrickOpRsp
+	err = client.Call("Brick.OpBrickTerminate", req, &rsp)
+	if err != nil {
+		log.WithError(err).WithField(
+			"brick", b.String()).Error("failed to send terminate RPC")
+		return err
+	}
+
+	if rsp.OpRet != 0 {
+		log.WithError(err).WithField(
+			"brick", b.String()).Error("failed to send terminate RPC")
+		return errors.New("RPC request failed")
+	}
+
+	if err := daemon.DelDaemon(brickDaemon); err != nil {
+		log.WithFields(log.Fields{
+			"name": brickDaemon.Name(),
+			"id":   brickDaemon.ID(),
+		}).WithError(err).Warn("failed to delete brick entry from store, it may be restarted on GlusterD restart")
+	}
+	return nil
+}
+
+//StopBrick will stop glusterfsd process
+func (b Brickinfo) StopBrick(logger log.FieldLogger) error {
+
+	brickDaemon, err := NewGlusterfsd(b)
+	if err != nil {
+		return err
+	}
+	return daemon.Stop(brickDaemon, true, logger)
 }
 
 //CreateBrickSizeInfo parses size information for response
@@ -216,7 +270,7 @@ func CreateBrickInfo(b *Brickinfo) api.BrickInfo {
 		Path:       b.Path,
 		VolumeID:   b.VolumeID,
 		VolumeName: b.VolumeName,
-		NodeID:     b.NodeID,
+		PeerID:     b.PeerID,
 		Hostname:   b.Hostname,
 		Type:       api.BrickType(b.Type),
 	}
@@ -231,4 +285,23 @@ func CreateSizeInfo(fstat *syscall.Statfs_t) *SizeInfo {
 		s.Used = s.Capacity - s.Free
 	}
 	return &s
+}
+
+//CreateBrickStatusRsp creates response related to brick process
+func CreateBrickStatusRsp(brickStatuses []Brickstatus) []*api.BrickStatus {
+	var brickStatusesRsp []*api.BrickStatus
+	for _, status := range brickStatuses {
+		s := &api.BrickStatus{
+			Info:      CreateBrickInfo(&status.Info),
+			Online:    status.Online,
+			Pid:       status.Pid,
+			Port:      status.Port,
+			FS:        status.FS,
+			MountOpts: status.MountOpts,
+			Device:    status.Device,
+			Size:      CreateBrickSizeInfo(&status.Size),
+		}
+		brickStatusesRsp = append(brickStatusesRsp, s)
+	}
+	return brickStatusesRsp
 }

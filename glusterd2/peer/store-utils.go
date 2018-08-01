@@ -20,6 +20,17 @@ const (
 	peerPrefix string = "peers/"
 )
 
+// metadataFilter is a filter type
+type metadataFilter uint32
+
+// GetPeers Filter Types
+const (
+	noKeyAndValue metadataFilter = iota
+	onlyKey
+	onlyValue
+	keyAndValue
+)
+
 var (
 	// GetPeerF returns specified peer from the store
 	GetPeerF = GetPeer
@@ -42,7 +53,7 @@ func AddOrUpdatePeer(p *Peer) error {
 
 	idStr := p.ID.String()
 
-	if _, err := store.Store.Put(context.TODO(), peerPrefix+idStr, string(json)); err != nil {
+	if _, err := store.Put(context.TODO(), peerPrefix+idStr, string(json)); err != nil {
 		return err
 	}
 
@@ -51,7 +62,7 @@ func AddOrUpdatePeer(p *Peer) error {
 
 // GetPeer returns specified peer from the store
 func GetPeer(id string) (*Peer, error) {
-	resp, err := store.Store.Get(context.TODO(), peerPrefix+id)
+	resp, err := store.Get(context.TODO(), peerPrefix+id)
 	if err != nil {
 		return nil, err
 	}
@@ -87,15 +98,35 @@ func GetInitialCluster() (string, error) {
 	return initialCluster, nil
 }
 
+// getFilterType return the filter type for peer list
+func getFilterType(filterParams map[string]string) metadataFilter {
+	_, key := filterParams["key"]
+	_, value := filterParams["value"]
+	if key && !value {
+		return onlyKey
+	} else if value && !key {
+		return onlyValue
+	} else if value && key {
+		return keyAndValue
+	}
+	return noKeyAndValue
+}
+
 // GetPeers returns all available peers in the store
-func GetPeers() ([]*Peer, error) {
-	resp, err := store.Store.Get(context.TODO(), peerPrefix, clientv3.WithPrefix())
+func GetPeers(filterParams ...map[string]string) ([]*Peer, error) {
+	resp, err := store.Get(context.TODO(), peerPrefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
+	var filterType metadataFilter
+	if len(filterParams) == 0 {
+		filterType = noKeyAndValue
+	} else {
+		filterType = getFilterType(filterParams[0])
+	}
 	// There will be at least one peer (current node)
-	peers := make([]*Peer, len(resp.Kvs))
-	for i, kv := range resp.Kvs {
+	var peers []*Peer
+	for _, kv := range resp.Kvs {
 		var p Peer
 
 		if err := json.Unmarshal(kv.Value, &p); err != nil {
@@ -105,7 +136,27 @@ func GetPeers() ([]*Peer, error) {
 			}).Error("Failed to unmarshal peer")
 			continue
 		}
-		peers[i] = &p
+		switch filterType {
+
+		case onlyKey:
+			if _, keyFound := p.Metadata[filterParams[0]["key"]]; keyFound {
+				peers = append(peers, &p)
+			}
+		case onlyValue:
+			for _, value := range p.Metadata {
+				if value == filterParams[0]["value"] {
+					peers = append(peers, &p)
+				}
+			}
+		case keyAndValue:
+			if value, keyFound := p.Metadata[filterParams[0]["key"]]; keyFound {
+				if value == filterParams[0]["value"] {
+					peers = append(peers, &p)
+				}
+			}
+		default:
+			peers = append(peers, &p)
+		}
 	}
 
 	return peers, nil
@@ -113,7 +164,7 @@ func GetPeers() ([]*Peer, error) {
 
 // GetPeerIDs returns peer id (uuid) of all peers in the store
 func GetPeerIDs() ([]uuid.UUID, error) {
-	resp, err := store.Store.Get(context.TODO(), peerPrefix, clientv3.WithPrefix())
+	resp, err := store.Get(context.TODO(), peerPrefix, clientv3.WithPrefix())
 	if err != nil {
 		return nil, err
 	}
@@ -152,13 +203,13 @@ func GetPeerByName(name string) (*Peer, error) {
 
 // DeletePeer deletes given peer from the store
 func DeletePeer(id string) error {
-	_, e := store.Store.Delete(context.TODO(), peerPrefix+id)
+	_, e := store.Delete(context.TODO(), peerPrefix+id)
 	return e
 }
 
 // Exists checks if given peer is present in the store
 func Exists(id string) bool {
-	resp, e := store.Store.Get(context.TODO(), peerPrefix+id)
+	resp, e := store.Get(context.TODO(), peerPrefix+id)
 	if e != nil {
 		return false
 	}
@@ -206,7 +257,7 @@ func GetPeerByAddrs(addrs []string) (*Peer, error) {
 func GetPeerIDByAddr(addr string) (uuid.UUID, error) {
 	p, e := GetPeerByAddrF(addr)
 	if e != nil {
-		return nil, errors.ErrPeerNotFound
+		return nil, e
 	}
 	return p.ID, nil
 }

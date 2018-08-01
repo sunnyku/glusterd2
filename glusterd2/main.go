@@ -14,9 +14,11 @@ import (
 	"github.com/gluster/glusterd2/glusterd2/peer"
 	"github.com/gluster/glusterd2/glusterd2/servers"
 	"github.com/gluster/glusterd2/glusterd2/store"
-	"github.com/gluster/glusterd2/glusterd2/volgen"
+	gdutils "github.com/gluster/glusterd2/glusterd2/utils"
 	"github.com/gluster/glusterd2/glusterd2/xlator"
+	"github.com/gluster/glusterd2/pkg/errors"
 	"github.com/gluster/glusterd2/pkg/logging"
+	"github.com/gluster/glusterd2/pkg/tracing"
 	"github.com/gluster/glusterd2/pkg/utils"
 	"github.com/gluster/glusterd2/version"
 
@@ -28,7 +30,6 @@ import (
 )
 
 func main() {
-
 	if err := gdctx.SetHostnameAndIP(); err != nil {
 		log.WithError(err).Fatal("Failed to get and set hostname or IP")
 	}
@@ -49,25 +50,42 @@ func main() {
 		log.WithError(err).Fatal("Failed to initialize logging")
 	}
 
-	log.WithFields(log.Fields{
-		"pid":     os.Getpid(),
-		"version": version.GlusterdVersion,
-	}).Debug("Starting GlusterD")
-
 	// Read config file
 	confFile, _ := flag.CommandLine.GetString("config")
 	if err := initConfig(confFile); err != nil {
 		log.WithError(err).Fatal("Failed to initialize config")
 	}
 
-	workdir := config.GetString("workdir")
+	logLevel2 := config.GetString("loglevel")
+	logdir2 := config.GetString("logdir")
+	logFileName2 := config.GetString("logfile")
+
+	if logLevel != logLevel2 || logdir != logdir2 || logFileName != logFileName2 {
+		if err := logging.Init(logdir2, logFileName2, logLevel2, true); err != nil {
+			log.WithError(err).Fatal("Failed to re-initialize logging")
+		}
+	}
+
+	log.WithFields(log.Fields{
+		"pid":     os.Getpid(),
+		"version": version.GlusterdVersion,
+	}).Debug("Starting GlusterD")
+
+	dumpConfigToLog()
+
+	workdir := config.GetString("localstatedir")
 	if err := os.Chdir(workdir); err != nil {
 		log.WithError(err).Fatalf("Failed to change working directory to %s", workdir)
 	}
 
-	// Create directories inside workdir - run dir, logdir etc
+	// Create directories inside localstatedir - run dir, logdir etc
 	if err := createDirectories(); err != nil {
 		log.WithError(err).Fatal("Failed to create or access directories")
+	}
+
+	// Create pidfile if specified
+	if err := createPidFile(); err != nil {
+		log.WithError(err).Fatal("Failed to create pid file")
 	}
 
 	if err := gdctx.InitUUID(); err != nil {
@@ -77,11 +95,6 @@ func main() {
 	// Load all possible xlator options
 	if err := xlator.Load(); err != nil {
 		log.WithError(err).Fatal("Failed to load xlator options")
-	}
-
-	// Load volgen templates
-	if err := volgen.LoadTemplates(); err != nil {
-		log.WithError(err).Fatal("Failed to load volgen templates")
 	}
 
 	// Initialize etcd store (etcd client connection)
@@ -103,9 +116,14 @@ func main() {
 		log.WithError(err).Fatal("Failed to load the default group options")
 	}
 
-	// If REST API Auth is enabled, Generate Auth file with random secret in workdir
+	// If REST API Auth is enabled, Generate Auth file with random secret in localstatedir
 	if err := gdctx.GenerateLocalAuthToken(); err != nil {
 		log.WithError(err).Fatal("Failed to generate local auth token")
+	}
+
+	// Create the Opencensus Jaeger exporter
+	if exporter := tracing.InitJaegerExporter(); exporter != nil {
+		defer exporter.Flush()
 	}
 
 	// Start all servers (rest, peerrpc, sunrpc) managed by suture supervisor
@@ -115,6 +133,9 @@ func main() {
 
 	// Restart previously running daemons
 	daemon.StartAllDaemons()
+
+	// Mount all Local Bricks
+	gdutils.MountLocalBricks()
 
 	// Use the main goroutine as signal handling loop
 	sigCh := make(chan os.Signal)
@@ -129,14 +150,15 @@ func main() {
 			super.Stop()
 			events.Stop()
 			store.Close()
+			_ = os.Remove(config.GetString("pidfile"))
 			log.Info("Stopped GlusterD")
 			return
 		case unix.SIGHUP:
 			// Logrotate case, when Log rotated, Reopen the log file and
 			// re-initiate the logger instance.
-			if strings.ToLower(logFileName) != "stderr" && strings.ToLower(logFileName) != "stdout" && logFileName != "-" {
+			if strings.ToLower(logFileName2) != "stderr" && strings.ToLower(logFileName2) != "stdout" && logFileName2 != "-" {
 				log.Info("Received SIGHUP, Reloading log file")
-				if err := logging.Init(logdir, logFileName, logLevel, true); err != nil {
+				if err := logging.Init(logdir2, logFileName2, logLevel2, true); err != nil {
 					log.WithError(err).Fatal("Could not re-initialize logging")
 				}
 			}
@@ -159,8 +181,15 @@ func initGD2Supervisor() *suture.Supervisor {
 func createDirectories() error {
 	dirs := []string{config.GetString("localstatedir"),
 		config.GetString("rundir"), config.GetString("logdir"),
-		path.Join(config.GetString("rundir"), "gluster"),
 		path.Join(config.GetString("logdir"), "glusterfs/bricks"),
+		path.Join(config.GetString("hooksdir"), "create/post"),
+		path.Join(config.GetString("hooksdir"), "start/post"),
+		path.Join(config.GetString("hooksdir"), "stop/post"),
+		path.Join(config.GetString("hooksdir"), "set/post"),
+		path.Join(config.GetString("hooksdir"), "reset/post"),
+		path.Join(config.GetString("hooksdir"), "delete/post"),
+		path.Join(config.GetString("hooksdir"), "add-brick/post"),
+		path.Join(config.GetString("hooksdir"), "remove-brick/post"),
 		"/var/run/gluster", // issue #476
 	}
 	for _, dirpath := range dirs {
@@ -169,4 +198,20 @@ func createDirectories() error {
 		}
 	}
 	return nil
+}
+
+func createPidFile() error {
+	pidfile := config.GetString("pidfile")
+
+	// Check if pidfile exists and already running
+	pid, err := daemon.ReadPidFromFile(pidfile)
+	if err == nil {
+		// Check if process is running
+		_, err := daemon.GetProcess(pid)
+		if err == nil {
+			return errors.ErrProcessAlreadyRunning
+		}
+	}
+
+	return daemon.WritePidToFile(os.Getpid(), pidfile)
 }

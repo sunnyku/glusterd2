@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -17,9 +18,37 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+var (
+	volumeNameRE = regexp.MustCompile("^[a-zA-Z0-9_-]+$")
+)
+
+// GenerateVolumeName generates volume name as vol_<random-id>
+func GenerateVolumeName() string {
+	return "vol_" + uuid.NewRandom().String()
+}
+
+// IsValidName validates Volume name
+func IsValidName(name string) bool {
+	return volumeNameRE.MatchString(name)
+}
+
+// GetRedundancy calculates redundancy count based on disperse count
+func GetRedundancy(disperse uint) int {
+	var temp, l, mask uint
+	temp = disperse
+	for temp = temp >> 1; temp != 0; temp = temp >> 1 {
+		l = l + 1
+	}
+	mask = ^(1 << l)
+	if red := disperse & mask; red != 0 {
+		return int(red)
+	}
+	return 1
+}
+
 // isBrickPathAvailable validates whether the brick is consumed by other
 // volume
-func isBrickPathAvailable(nodeID uuid.UUID, brickPath string) error {
+func isBrickPathAvailable(peerID uuid.UUID, brickPath string) error {
 	volumes, e := GetVolumes()
 	if e != nil || volumes == nil {
 		// In case cluster doesn't have any volumes configured yet,
@@ -29,7 +58,7 @@ func isBrickPathAvailable(nodeID uuid.UUID, brickPath string) error {
 	}
 	for _, v := range volumes {
 		for _, b := range v.GetBricks() {
-			if uuid.Equal(b.NodeID, nodeID) && b.Path == brickPath {
+			if uuid.Equal(b.PeerID, peerID) && b.Path == brickPath {
 				log.Error("Brick is already used by ", v.Name)
 				return gderrors.ErrBrickPathAlreadyInUse
 			}
@@ -38,29 +67,11 @@ func isBrickPathAvailable(nodeID uuid.UUID, brickPath string) error {
 	return nil
 }
 
-// IsBitrotEnabled returns true if bitrot is enabled for a volume and false otherwise
-func IsBitrotEnabled(v *Volinfo) bool {
-	val, exists := v.Options[VkeyFeaturesBitrot]
-	if exists && val == "on" {
-		return true
-	}
-	return false
-}
-
-// IsQuotaEnabled returns true if bitrot is enabled for a volume and false otherwise
-func IsQuotaEnabled(v *Volinfo) bool {
-	val, exists := v.Options[VkeyFeaturesQuota]
-	if exists && val == "on" {
-		return true
-	}
-	return false
-}
-
 //CheckBricksStatus will give detailed information about brick
 func CheckBricksStatus(volinfo *Volinfo) ([]brick.Brickstatus, error) {
 
 	var brickStatuses []brick.Brickstatus
-	mtabEntries, err := getMounts()
+	mtabEntries, err := GetMounts()
 	if err != nil {
 		log.WithError(err).Error("Failed to read /etc/mtab file.")
 		return brickStatuses, err
@@ -93,10 +104,10 @@ func CheckBricksStatus(volinfo *Volinfo) ([]brick.Brickstatus, error) {
 		}
 
 		for _, m := range mtabEntries {
-			if strings.HasPrefix(binfo.Path, m.mntDir) {
-				s.MountOpts = m.mntOpts
-				s.Device = m.fsName
-				s.FS = m.mntType
+			if strings.HasPrefix(binfo.Path, m.MntDir) {
+				s.MountOpts = m.MntOpts
+				s.Device = m.FsName
+				s.FS = m.MntType
 			}
 		}
 
@@ -132,26 +143,26 @@ func GetBrickMountRoot(brickPath string) (string, error) {
 	if mntSt := mntStat.Sys().(*syscall.Stat_t); brickSt.Dev == mntSt.Dev {
 		return "/", nil
 	}
-	return "", errors.New("Failed To Get Mount Root")
+	return "", errors.New("failed to get mount root")
 }
 
-//GetBrickMountDevice return device name of the mount point
-func GetBrickMountDevice(brickPath, mountRoot string) (string, error) {
-	mtabEntries, err := getMounts()
+//GetBrickMountInfo return mount related information
+func GetBrickMountInfo(mountRoot string) (*Mntent, error) {
+	mtabEntries, err := GetMounts()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	for _, entry := range mtabEntries {
-		if entry.mntDir == mountRoot {
-			return entry.fsName, nil
+		if entry.MntDir == mountRoot {
+			return entry, nil
 		}
 	}
-	return "", errors.New("Mount Point Not Found")
+	return nil, errors.New("mount point not found")
 
 }
 
-//CreateSubvolInfo parses subvol  information for response
+//CreateSubvolInfo parses subvol information for response
 func CreateSubvolInfo(sv *[]Subvol) []api.Subvol {
 	var subvols []api.Subvol
 
@@ -162,20 +173,21 @@ func CreateSubvolInfo(sv *[]Subvol) []api.Subvol {
 		}
 
 		subvols = append(subvols, api.Subvol{
-			Name:         subvol.Name,
-			Type:         api.SubvolType(subvol.Type),
-			Bricks:       blist,
-			ReplicaCount: subvol.ReplicaCount,
-			ArbiterCount: subvol.ArbiterCount,
+			Name:          subvol.Name,
+			Type:          api.SubvolType(subvol.Type),
+			Bricks:        blist,
+			ReplicaCount:  subvol.ReplicaCount,
+			ArbiterCount:  subvol.ArbiterCount,
+			DisperseCount: subvol.DisperseCount,
 		})
 	}
 	return subvols
 }
 
-//CreateVolumeInfoResp parses volume  information for response
+//CreateVolumeInfoResp parses volume information for response
 func CreateVolumeInfoResp(v *Volinfo) *api.VolumeInfo {
 
-	return &api.VolumeInfo{
+	resp := &api.VolumeInfo{
 		ID:        v.ID,
 		Name:      v.Name,
 		Type:      api.VolType(v.Type),
@@ -184,5 +196,16 @@ func CreateVolumeInfoResp(v *Volinfo) *api.VolumeInfo {
 		State:     api.VolState(v.State),
 		Options:   v.Options,
 		Subvols:   CreateSubvolInfo(&v.Subvols),
+		Metadata:  v.Metadata,
+		SnapList:  v.SnapList,
 	}
+
+	// for common use cases, replica count of the volume is usually the
+	// replica count of any one of the subvols and we take replica count
+	// from the first subvol
+	resp.ReplicaCount = resp.Subvols[0].ReplicaCount
+	resp.ArbiterCount = resp.Subvols[0].ArbiterCount
+	resp.DisperseCount = resp.Subvols[0].DisperseCount
+
+	return resp
 }

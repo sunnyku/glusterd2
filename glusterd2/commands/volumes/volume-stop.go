@@ -14,39 +14,31 @@ import (
 	"github.com/gluster/glusterd2/pkg/errors"
 
 	"github.com/gorilla/mux"
+	"github.com/pborman/uuid"
 	log "github.com/sirupsen/logrus"
 )
 
 func stopBricks(c transaction.TxnCtx) error {
 
-	var volname string
-	if err := c.Get("volname", &volname); err != nil {
-		c.Logger().WithError(err).WithField(
-			"key", "volname").Error("failed to get value for key from context")
+	var volinfo volume.Volinfo
+	if err := c.Get("volinfo", &volinfo); err != nil {
 		return err
 	}
 
-	vol, err := volume.GetVolume(volname)
-	if err != nil {
-		c.Logger().WithError(err).WithField(
-			"volume", volname).Error("failed to get volinfo for volume")
-		return err
-	}
-
-	for _, b := range vol.GetLocalBricks() {
+	for _, b := range volinfo.GetLocalBricks() {
 		brickDaemon, err := brick.NewGlusterfsd(b)
 		if err != nil {
 			return err
 		}
 
 		c.Logger().WithFields(log.Fields{
-			"volume": volname, "brick": b.String()}).Info("Stopping brick")
+			"volume": volinfo.Name, "brick": b.String()}).Info("Stopping brick")
 
 		client, err := daemon.GetRPCClient(brickDaemon)
 		if err != nil {
 			c.Logger().WithError(err).WithField(
 				"brick", b.String()).Error("failed to connect to brick, sending SIGTERM")
-			daemon.Stop(brickDaemon, false)
+			daemon.Stop(brickDaemon, false, c.Logger())
 			continue
 		}
 
@@ -59,7 +51,7 @@ func stopBricks(c transaction.TxnCtx) error {
 		if err != nil || rsp.OpRet != 0 {
 			c.Logger().WithError(err).WithField(
 				"brick", b.String()).Error("failed to send terminate RPC, sending SIGTERM")
-			daemon.Stop(brickDaemon, false)
+			daemon.Stop(brickDaemon, false, c.Logger())
 			continue
 		}
 
@@ -71,65 +63,80 @@ func stopBricks(c transaction.TxnCtx) error {
 			}).WithError(err).Warn("failed to delete brick entry from store, it may be restarted on GlusterD restart")
 		}
 	}
+
 	return nil
 }
 
 func registerVolStopStepFuncs() {
-	transaction.RegisterStepFunc(stopBricks, "vol-stop.Commit")
+	transaction.RegisterStepFunc(stopBricks, "vol-stop.StopBricks")
+	transaction.RegisterStepFunc(storeVolume, "vol-stop.UpdateVolinfo")
+	transaction.RegisterStepFunc(undoStoreVolume, "vol-stop.UpdateVolinfo.Undo")
 }
 
 func volumeStopHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	logger := gdctx.GetReqLogger(ctx)
-
 	volname := mux.Vars(r)["volname"]
-	vol, e := volume.GetVolume(volname)
-	if e != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound, errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
-		return
-	}
-	if vol.State == volume.VolStopped {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrVolAlreadyStopped.Error(), api.ErrCodeDefault)
-		return
-	}
 
-	// A simple one-step transaction to stop brick processes
-	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
-	lock, unlock, err := transaction.CreateLockSteps(volname)
+	txn, err := transaction.NewTxnWithLocks(ctx, volname)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
+	defer txn.Done()
+
+	volinfo, err := volume.GetVolume(volname)
+	if err != nil {
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
+		return
+	}
+
+	if volinfo.State == volume.VolStopped {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrVolAlreadyStopped)
+		return
+	}
+
 	txn.Steps = []*transaction.Step{
-		lock,
 		{
-			DoFunc: "vol-stop.Commit",
-			Nodes:  vol.Nodes(),
+			DoFunc: "vol-stop.StopBricks",
+			Nodes:  volinfo.Nodes(),
 		},
-		unlock,
+		{
+			DoFunc:   "vol-stop.UpdateVolinfo",
+			UndoFunc: "vol-stop.UpdateVolinfo.Undo",
+			Nodes:    []uuid.UUID{gdctx.MyUUID},
+		},
 	}
-	txn.Ctx.Set("volname", volname)
 
-	if err = txn.Do(); err != nil {
+	if err := txn.Ctx.Set("oldvolinfo", volinfo); err != nil {
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	volinfo.State = volume.VolStopped
+
+	if err := txn.Ctx.Set("volinfo", volinfo); err != nil {
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err := txn.Do(); err != nil {
 		logger.WithError(err).WithField(
-			"volume", volname).Error("failed to stop volume")
-		if err == transaction.ErrLockTimeout {
-			restutils.SendHTTPError(ctx, w, http.StatusConflict, err.Error(), api.ErrCodeDefault)
-		} else {
-			restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
-		}
+			"volume", volname).Error("transaction to stop volume failed")
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 
-	vol.State = volume.VolStopped
+	logger.WithField("volume-name", volinfo.Name).Info("volume stopped")
+	events.Broadcast(volume.NewEvent(volume.EventVolumeStopped, volinfo))
 
-	e = volume.AddOrUpdateVolumeFunc(vol)
-	if e != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, e.Error(), api.ErrCodeDefault)
-		return
-	}
-	events.Broadcast(newVolumeEvent(eventVolumeStopped, vol))
-	restutils.SendHTTPResponse(ctx, w, http.StatusOK, vol)
+	resp := createVolumeStopResp(volinfo)
+	restutils.SendHTTPResponse(ctx, w, http.StatusOK, resp)
+}
+
+func createVolumeStopResp(v *volume.Volinfo) *api.VolumeStopResp {
+	return (*api.VolumeStopResp)(volume.CreateVolumeInfoResp(v))
 }

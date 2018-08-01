@@ -19,6 +19,13 @@ import (
 	"github.com/justinas/alice"
 	log "github.com/sirupsen/logrus"
 	config "github.com/spf13/viper"
+	"go.opencensus.io/plugin/ochttp"
+)
+
+const (
+	httpReadTimeout  = 10
+	httpWriteTimeout = 30
+	maxHeaderBytes   = 1 << 13 // 8KB
 )
 
 // GDRest is the GlusterD Rest server
@@ -50,7 +57,11 @@ func NewMuxed(m cmux.CMux) *GDRest {
 
 	rest := &GDRest{
 		Routes: mux.NewRouter(),
-		server: &http.Server{},
+		server: &http.Server{
+			ReadTimeout:    httpReadTimeout * time.Second,
+			WriteTimeout:   httpWriteTimeout * time.Second,
+			MaxHeaderBytes: maxHeaderBytes,
+		},
 		stopCh: make(chan struct{}),
 	}
 
@@ -74,14 +85,17 @@ func NewMuxed(m cmux.CMux) *GDRest {
 
 	rest.registerRoutes()
 
-	// Chain of ordered middlewares.
-	rest.server.Handler = alice.New(
-		middleware.Expvar,
-		middleware.Recover,
-		middleware.ReqIDGenerator,
-		middleware.LogRequest,
-		middleware.Auth,
-	).Then(rest.Routes)
+	// Set Handler to opencensus HTTP handler to enable tracing
+	// Set chain of ordered middlewares
+	rest.server.Handler = &ochttp.Handler{
+		Handler: alice.New(
+			middleware.Recover,
+			middleware.Expvar,
+			middleware.ReqIDGenerator,
+			middleware.LogRequest,
+			middleware.Auth,
+		).Then(rest.Routes),
+	}
 
 	return rest
 }
@@ -133,5 +147,13 @@ func (r *GDRest) listEndpointsHandler() http.HandlerFunc {
 			})
 		}
 		restutils.SendHTTPResponse(ctx, w, http.StatusOK, resp)
+	})
+}
+
+//Ping URL for glusterd2
+func (r *GDRest) Ping() http.HandlerFunc {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		restutils.SendHTTPResponse(ctx, w, http.StatusOK, nil)
 	})
 }

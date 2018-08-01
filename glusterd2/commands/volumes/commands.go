@@ -33,12 +33,34 @@ func (c *Command) Routes() route.Routes {
 		// TODO: Implmement volume reset as
 		// DELETE /volumes/{volname}/options
 		route.Route{
-			Name:        "VolumeOptions",
-			Method:      "POST",
+			Name:         "VolumeOptionGet",
+			Method:       "GET",
+			Pattern:      "/volumes/{volname}/options/{optname}",
+			Version:      1,
+			ResponseType: utils.GetTypeString((*api.VolumeOptionGetResp)(nil)),
+			HandlerFunc:  volumeOptionsGetHandler},
+		route.Route{
+			Name:         "VolumeOptionsGet",
+			Method:       "GET",
+			Pattern:      "/volumes/{volname}/options",
+			Version:      1,
+			ResponseType: utils.GetTypeString((*api.VolumeOptionsGetResp)(nil)),
+			HandlerFunc:  volumeOptionsGetHandler},
+		route.Route{
+			Name:         "VolumeOptions",
+			Method:       "POST",
+			Pattern:      "/volumes/{volname}/options",
+			Version:      1,
+			RequestType:  utils.GetTypeString((*api.VolOptionReq)(nil)),
+			ResponseType: utils.GetTypeString((*api.VolumeOptionResp)(nil)),
+			HandlerFunc:  volumeOptionsHandler},
+		route.Route{
+			Name:        "VolumeReset",
+			Method:      "DELETE",
 			Pattern:     "/volumes/{volname}/options",
 			Version:     1,
-			RequestType: utils.GetTypeString((*api.VolOptionReq)(nil)),
-			HandlerFunc: volumeOptionsHandler},
+			RequestType: utils.GetTypeString((*api.VolOptionResetReq)(nil)),
+			HandlerFunc: volumeResetHandler},
 		route.Route{
 			Name:         "OptionGroupList",
 			Method:       "GET",
@@ -94,17 +116,27 @@ func (c *Command) Routes() route.Routes {
 			ResponseType: utils.GetTypeString((*api.VolumeListResp)(nil)),
 			HandlerFunc:  volumeListHandler},
 		route.Route{
-			Name:        "VolumeStart",
-			Method:      "POST",
-			Pattern:     "/volumes/{volname}/start",
-			Version:     1,
-			HandlerFunc: volumeStartHandler},
+			Name:         "VolumeStart",
+			Method:       "POST",
+			Pattern:      "/volumes/{volname}/start",
+			Version:      1,
+			RequestType:  utils.GetTypeString((*api.VolumeStartReq)(nil)),
+			ResponseType: utils.GetTypeString((*api.VolumeStartResp)(nil)),
+			HandlerFunc:  volumeStartHandler},
 		route.Route{
-			Name:        "VolumeStop",
+			Name:         "VolumeStop",
+			Method:       "POST",
+			Pattern:      "/volumes/{volname}/stop",
+			Version:      1,
+			ResponseType: utils.GetTypeString((*api.VolumeStopResp)(nil)),
+			HandlerFunc:  volumeStopHandler},
+		route.Route{
+			Name:        "Statedump",
 			Method:      "POST",
-			Pattern:     "/volumes/{volname}/stop",
+			Pattern:     "/volumes/{volname}/statedump",
 			Version:     1,
-			HandlerFunc: volumeStopHandler},
+			RequestType: utils.GetTypeString((*api.VolStatedumpReq)(nil)),
+			HandlerFunc: volumeStatedumpHandler},
 		route.Route{
 			Name:        "VolfilesGenerate",
 			Method:      "POST",
@@ -117,6 +149,20 @@ func (c *Command) Routes() route.Routes {
 			Pattern:     "/volfiles",
 			Version:     1,
 			HandlerFunc: volfilesListHandler},
+		route.Route{
+			Name:        "VolfilesGet",
+			Method:      "GET",
+			Pattern:     "/volfiles/{volfileid:.*}",
+			Version:     1,
+			HandlerFunc: volfileGetHandler},
+		route.Route{
+			Name:         "EditVolume",
+			Method:       "POST",
+			Pattern:      "/volumes/{volname}/edit",
+			Version:      1,
+			RequestType:  utils.GetTypeString((*api.VolEditReq)(nil)),
+			ResponseType: utils.GetTypeString((*api.VolumeEditResp)(nil)),
+			HandlerFunc:  volumeEditHandler},
 	}
 }
 
@@ -129,4 +175,6 @@ func (c *Command) RegisterStepFuncs() {
 	registerBricksStatusStepFuncs()
 	registerVolExpandStepFuncs()
 	registerVolOptionStepFuncs()
+	registerVolOptionResetStepFuncs()
+	registerVolStatedumpFuncs()
 }

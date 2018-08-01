@@ -48,13 +48,16 @@ type OptionFlag uint
 
 // These are the available OptionFlags
 const (
-	OptionFlagNone     OptionFlag = 0
-	OptionFlagSettable            = 1 << iota
+	OptionFlagSettable OptionFlag = 1 << iota
 	OptionFlagClientOpt
 	OptionFlagGlobal
 	OptionFlagForce
 	OptionFlagNeverReset
 	OptionFlagDoc
+	// Setting FlagNone instead of the beginning as iota starts incrementing from
+	// the first line in a const block, not the first line it is used.
+	// Ref: https://github.com/golang/go/wiki/Iota
+	OptionFlagNone = 0
 )
 
 // OptionLevel is the level at which option is visible to users
@@ -68,14 +71,29 @@ const (
 	OptionStatusDeprecated
 )
 
+func (l OptionLevel) String() string {
+	switch l {
+	case OptionStatusBasic:
+		return "Basic"
+	case OptionStatusAdvanced:
+		return "Advanced"
+	case OptionStatusExperimental:
+		return "Experimental"
+	case OptionStatusDeprecated:
+		return "Deprecated"
+	default:
+		return "Undefined"
+	}
+}
+
 // ErrInvalidArg validates if argument is Invalid
-var ErrInvalidArg = errors.New("Invalid Value")
+var ErrInvalidArg = errors.New("invalid Value")
 
 // ErrEmptyArg validates for empty arguments
-var ErrEmptyArg = errors.New("No value passed")
+var ErrEmptyArg = errors.New("no value passed")
 
 //ErrInvalidRange validates if option is out of range
-var ErrInvalidRange = errors.New("Option is out of valid range")
+var ErrInvalidRange = errors.New("option is out of valid range")
 
 // Option is a struct which represents one single xlator option exported by
 // the translator.
@@ -90,10 +108,43 @@ type Option struct {
 	ValidateType OptionValidateType
 	OpVersion    []uint32
 	Deprecated   []uint32
-	Flags        uint32
+	Flags        OptionFlag
 	Tags         []string
 	SetKey       string
 	Level        OptionLevel
+}
+
+// IsSettable returns true if the option can be set by a user, returns false
+// otherwise.
+func (o *Option) IsSettable() bool {
+	return (o.Flags & OptionFlagSettable) == OptionFlagSettable
+}
+
+// IsNeverReset returns true if the option should never be set by a user,
+// returns false otherwise.
+func (o *Option) IsNeverReset() bool {
+	return (o.Flags & OptionFlagNeverReset) == OptionFlagNeverReset
+}
+
+// IsForceRequired returns true if the option requires force variable for the
+// user to set returns false otherwise.
+func (o *Option) IsForceRequired() bool {
+	return (o.Flags & OptionFlagForce) == OptionFlagForce
+}
+
+// IsAdvanced returns true if the option is an advanced option
+func (o *Option) IsAdvanced() bool {
+	return o.Level == OptionStatusAdvanced
+}
+
+// IsExperimental returns true if the option is experimental
+func (o *Option) IsExperimental() bool {
+	return o.Level == OptionStatusExperimental
+}
+
+// IsDeprecated returns true if the option is deprcated
+func (o *Option) IsDeprecated() bool {
+	return o.Level == OptionStatusDeprecated
 }
 
 // Validate checks if the given value string can be set as the value for the
@@ -196,16 +247,17 @@ func ValidateInternetAddress(o *Option, val string) error {
 	if len(val) == 0 {
 		return ErrInvalidArg
 	}
-	if !(validate.IsHost(val)) {
-		return ErrInvalidArg
-	} else if !(validate.IsIP(val)) {
-		return ErrInvalidArg
-	} else if !(validate.IsCIDR(val)) {
-		return ErrInvalidArg
-	} else if !(strings.ContainsAny(val, "* & # & ? & ^")) {
-		return ErrInvalidArg
+	if validate.IsHost(val) {
+		return nil
+	} else if validate.IsIP(val) {
+		return nil
+	} else if validate.IsCIDR(val) {
+		return nil
+	} else if strings.ContainsAny(val, "* & # & ? & ^") {
+		return nil
 	}
-	return nil
+
+	return ErrInvalidArg
 }
 
 // ValidateInternetAddressList validates the Internet Address List

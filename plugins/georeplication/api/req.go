@@ -1,8 +1,8 @@
-package georeplication
+package api
 
 // GeorepRemoteHostReq represents Remote host ID and IP/Hostname
 type GeorepRemoteHostReq struct {
-	NodeID   string `json:"nodeid"`
+	PeerID   string `json:"peerid"`
 	Hostname string `json:"host"`
 }
 

@@ -2,6 +2,7 @@ package brick
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/pborman/uuid"
 	"golang.org/x/sys/unix"
@@ -18,16 +19,25 @@ const (
 	Arbiter
 )
 
+//MountInfo is used to store mount related information of a volume
+type MountInfo struct {
+	Mountdir   string
+	DevicePath string
+	FsType     string
+	MntOpts    string
+}
+
 // Brickinfo is the static information about the brick
 type Brickinfo struct {
 	ID             uuid.UUID
 	Hostname       string
-	NodeID         uuid.UUID
+	PeerID         uuid.UUID
 	Path           string
 	VolumeName     string
 	VolumeID       uuid.UUID
 	Type           Type
 	Decommissioned bool
+	MountInfo
 }
 
 // SizeInfo represents sizing information.
@@ -50,7 +60,7 @@ type Brickstatus struct {
 }
 
 func (b *Brickinfo) String() string {
-	return b.NodeID.String() + ":" + b.Path
+	return b.PeerID.String() + ":" + b.Path
 }
 
 // StringMap returns a map[string]string representation of the Brickinfo
@@ -59,7 +69,7 @@ func (b *Brickinfo) StringMap() map[string]string {
 
 	m["brick.id"] = b.ID.String()
 	m["brick.hostname"] = b.Hostname
-	m["brick.nodeid"] = b.NodeID.String()
+	m["brick.peerid"] = b.PeerID.String()
 	m["brick.path"] = b.Path
 	m["brick.volumename"] = b.VolumeName
 	m["brick.volumeid"] = b.VolumeID.String()
@@ -69,7 +79,7 @@ func (b *Brickinfo) StringMap() map[string]string {
 
 // Validate checks if brick path is valid, if brick is a mount point,
 // if brick is on root partition and if it has xattr support.
-func (b *Brickinfo) Validate(check InitChecks) error {
+func (b *Brickinfo) Validate(check InitChecks, allLocalBricks []Brickinfo) error {
 
 	var (
 		brickStat unix.Stat_t
@@ -78,6 +88,16 @@ func (b *Brickinfo) Validate(check InitChecks) error {
 
 	if err = validatePathLength(b.Path); err != nil {
 		return err
+	}
+
+	if _, err = os.Stat(b.Path); os.IsNotExist(err) {
+		if check.CreateBrickDir {
+			if err = os.MkdirAll(b.Path, 0775); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 
 	if err = unix.Lstat(b.Path, &brickStat); err != nil {
@@ -104,10 +124,15 @@ func (b *Brickinfo) Validate(check InitChecks) error {
 		return err
 	}
 
-	if check.IsInUse {
-		if err = validateBrickInUse(b.Path); err != nil {
+	if check.WasInUse {
+		if err = validateBrickWasUsed(b.Path); err != nil {
 			return err
 		}
+	}
+
+	// mandatory check that cannot be skipped forcefully
+	if err = isBrickInActiveUse(b.Path, allLocalBricks); err != nil {
+		return err
 	}
 
 	return nil

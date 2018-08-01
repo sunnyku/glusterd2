@@ -26,21 +26,30 @@ Install rpcbind:
 
 **Installing glusterfs from nightly RPMs (CentOS 7):**
 
+These packages require dependencies present in [EPEL](https://fedoraproject.org/wiki/EPEL). Enable the EPEL repositories before enabling gluster nightly packages repo below.
+
 Install packages that provide GlusterFS server (brick process) and client (fuse, libgfapi):
 
 ```sh
-# curl -o /etc/yum.repos.d/glusterfs-nighthly-master.repo http://artifacts.ci.centos.org/gluster/nightly/master.repo
-# dnf install glusterfs-server glusterfs-fuse glusterfs-api
+# curl -o /etc/yum.repos.d/glusterfs-nightly-master.repo http://artifacts.ci.centos.org/gluster/nightly/master.repo
+# yum install glusterfs-server glusterfs-fuse glusterfs-api
 ```
 
 ### Download glusterd2
 
-Glusterd2 is a single binary without any external dependencies. Like all Go programs, dependencies are statically linked. You can download the [latest release](https://github.com/gluster/glusterd2/releases) from Github.
+As we do not have releases often, our nightly RPMs are generally more stable
+as they contain the latest fixes. If you are on centos 7, you can download the
+latest glusterd2 nightly RPM using the following method:
 
 ```sh
-$ wget https://github.com/gluster/glusterd2/releases/download/v4.0dev-7/glusterd2-v4.0dev-7-linux-amd64.tar.xz
-$ tar -xf glusterd2-v4.0dev-7-linux-amd64.tar.xz
+# curl -o /etc/yum.repos.d/glusterd2-nightly-master.repo http://artifacts.ci.centos.org/gluster/gd2-nightly/gd2-master.repo
+# yum install glusterd2
 ```
+
+Alternatlively, if you are using a non-RPM based distro, you can download
+binaries of the latest release. Like all Go programs, glusterd2 is a single
+binary (statically linked) without external dependencies. You can download the
+[latest release](https://github.com/gluster/glusterd2/releases) from Github.
 
 ### Running glusterd2
 
@@ -55,7 +64,7 @@ Glusterd2 will also pick up conf file named `glusterd2.toml` if available in `/e
 
 ```toml
 $ cat conf.toml
-workdir = "/var/lib/gd2"
+localstatedir = "/var/lib/gd2"
 peeraddress = "192.168.56.101:24008"
 clientaddress = "192.168.56.101:24007"
 etcdcurls = "http://192.168.56.101:2379"
@@ -83,9 +92,9 @@ INFO[2017-08-28T16:03:58+05:30] started GlusterD SunRPC server                ip
 
 Now you have two nodes running glusterd2.
 
-> NOTE: Ensure that firewalld is configured (or stopped) to let traffic on ports ` before attaching a peer.
+> NOTE: Ensure that firewalld is configured (or stopped) to let traffic on ports ` before adding a peer.
 
-## Attach peer
+## Add peer
 
 Glusterd2 natively provides only ReST API for clients to perform management operations. A CLI is provided which interacts with glusterd2 using the [ReST APIs](https://github.com/gluster/glusterd2/wiki/ReST-API).
 
@@ -99,7 +108,7 @@ $ cat addpeer.json
 	"addresses": ["192.168.56.102"]
 }
 ```
-`addresses` takes a list of address by which the new host can be added. It can be FQDNs, short-names or IP addresses. Note that if you want to attach multiple peers use below API to attach each peer one at a time.
+`addresses` takes a list of address by which the new host can be added. It can be FQDNs, short-names or IP addresses. Note that if you want to add multiple peers use below API to add each peer one at a time.
 
 Send a HTTP request to `node1` to add `node2` as peer:
 
@@ -109,7 +118,7 @@ $ curl -X POST http://192.168.56.101:24007/v1/peers --data @addpeer.json -H 'Con
 
 or using glustercli:
 
-    $ glustercli peer probe 192.168.56.102
+    $ glustercli peer add 192.168.56.102
 
 You will get the Peer ID of the newly added peer as response.
 
@@ -123,7 +132,7 @@ $ curl -X GET http://192.168.56.101:24007/v1/peers
 
 or by using the glustercli:
 
-    $ glustercli pool list
+    $ glustercli peer list
 
 Note the UUIDs in the response. We will use the same in volume create request below.
 
@@ -139,16 +148,16 @@ $ cat volcreate.json
             {
                 "type": "replicate",
                 "bricks": [
-                    {"nodeid": "<uuid1>", "path": "/export/brick1/data"},
-                    {"nodeid": "<uuid2>", "path": "/export/brick2/data"}
+                    {"peerid": "<uuid1>", "path": "/export/brick1/data"},
+                    {"peerid": "<uuid2>", "path": "/export/brick2/data"}
                 ],
                 "replica": 2
             },
             {
                 "type": "replicate",
                 "bricks": [
-                    {"nodeid": "<uuid1>", "path": "/export/brick3/data"},
-                    {"nodeid": "<uuid2>", "path": "/export/brick4/data"}
+                    {"peerid": "<uuid1>", "path": "/export/brick3/data"},
+                    {"peerid": "<uuid2>", "path": "/export/brick4/data"}
                 ],
                 "replica": 2
             }
@@ -172,7 +181,7 @@ $ curl -X POST http://192.168.56.101:24007/v1/volumes --data @volcreate.json -H 
 
 Send the volume create request using glustercli:
 
-    $ glustercli volume create testvol <uuid1>:/export/brick1/data <uuid2>:/export/brick2/data <uuid1>:/export/brick3/data <uuid2>:/export/brick4/data --replica 2
+    $ glustercli volume create --name testvol <uuid1>:/export/brick1/data <uuid2>:/export/brick2/data <uuid1>:/export/brick3/data <uuid2>:/export/brick4/data --replica 2
 
 ## Start the volume
 
@@ -199,4 +208,4 @@ Verify that `glusterfsd` process is running on both nodes.
 
 * Issues with 2 node clusters
   * Restarting glusterd2 does not restore the cluster
-  * Peer detach doesn't work
+  * Peer remove doesn't work

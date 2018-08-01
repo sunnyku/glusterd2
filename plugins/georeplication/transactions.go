@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path"
 	"strings"
 	"syscall"
@@ -15,6 +14,7 @@ import (
 	"github.com/gluster/glusterd2/glusterd2/gdctx"
 	"github.com/gluster/glusterd2/glusterd2/transaction"
 	"github.com/gluster/glusterd2/glusterd2/volume"
+	"github.com/gluster/glusterd2/pkg/utils"
 
 	georepapi "github.com/gluster/glusterd2/plugins/georeplication/api"
 
@@ -79,13 +79,13 @@ func gsyncdAction(c transaction.TxnCtx, action actionType) error {
 		if err != nil {
 			return err
 		}
-		err = daemon.Start(gsyncdDaemon, true)
+		err = daemon.Start(gsyncdDaemon, true, c.Logger())
 	case actionStop:
-		err = daemon.Stop(gsyncdDaemon, true)
+		err = daemon.Stop(gsyncdDaemon, true, c.Logger())
 	case actionPause:
-		err = daemon.Signal(gsyncdDaemon, syscall.SIGSTOP)
+		err = daemon.Signal(gsyncdDaemon, syscall.SIGSTOP, c.Logger())
 	case actionResume:
-		err = daemon.Signal(gsyncdDaemon, syscall.SIGCONT)
+		err = daemon.Signal(gsyncdDaemon, syscall.SIGCONT, c.Logger())
 	}
 
 	return err
@@ -166,7 +166,7 @@ func txnGeorepStatus(c transaction.TxnCtx) error {
 		}
 		args := gsyncd.statusArgs(w.Path)
 
-		out, err := exec.Command(gsyncdCommand, args...).Output()
+		out, err := utils.ExecuteCommandOutput(gsyncdCommand, args...)
 		if err != nil {
 			return err
 		}
@@ -255,18 +255,19 @@ func configFileGenerate(session *georepapi.GeorepSession) error {
 	}
 
 	// Remote host and UUID details
-	var remote []string
+	var remote = make([]string, 0, len(session.RemoteHosts))
 	for _, sh := range session.RemoteHosts {
-		remote = append(remote, sh.NodeID.String()+":"+sh.Hostname)
+		remote = append(remote, sh.PeerID.String()+":"+sh.Hostname)
 	}
 	confdata = append(confdata,
 		fmt.Sprintf("slave-bricks=%s", strings.Join(remote, ",")),
 	)
 
 	// Master Bricks details
-	var master []string
-	for _, b := range vol.GetBricks() {
-		master = append(master, b.NodeID.String()+":"+b.Hostname+":"+b.Path)
+	bricks := vol.GetBricks()
+	var master = make([]string, 0, len(bricks))
+	for _, b := range bricks {
+		master = append(master, b.PeerID.String()+":"+b.Hostname+":"+b.Path)
 	}
 	confdata = append(confdata,
 		fmt.Sprintf("master-bricks=%s", strings.Join(master, ",")),
@@ -322,19 +323,18 @@ func txnGeorepConfigFilegen(c transaction.TxnCtx) error {
 	}
 
 	if restartRequired {
-		err = gsyncdAction(c, actionStop)
-		if err != nil {
+
+		if err = gsyncdAction(c, actionStop); err != nil {
 			return err
 		}
-		err = gsyncdAction(c, actionStart)
-		if err != nil {
+
+		if err = gsyncdAction(c, actionStart); err != nil {
 			return err
 		}
 	} else {
 		// Restart not required, Generate config file Gsynd will reload
 		// automatically if running
-		err = configFileGenerate(&session)
-		if err != nil {
+		if err = configFileGenerate(&session); err != nil {
 			return err
 		}
 	}
@@ -362,17 +362,17 @@ func txnSSHKeysGenerate(c transaction.TxnCtx) error {
 	)
 
 	// Create Directory if not exists
-	err = os.MkdirAll(path.Dir(secretPemFile), os.ModeDir|os.ModePerm)
-	if err != nil {
+
+	if err = os.MkdirAll(path.Dir(secretPemFile), os.ModeDir|os.ModePerm); err != nil {
 		return err
 	}
 
-	sshkey := georepapi.GeorepSSHPublicKey{NodeID: gdctx.MyUUID}
+	sshkey := georepapi.GeorepSSHPublicKey{PeerID: gdctx.MyUUID}
 
 	// Generate secret.pem file if not available
 	if _, err := os.Stat(secretPemFile); os.IsNotExist(err) {
 		args = []string{"-N", "", "-f", secretPemFile}
-		_, err = exec.Command("ssh-keygen", args...).Output()
+		_, err = utils.ExecuteCommandOutput("ssh-keygen", args...)
 		if err != nil {
 			return err
 		}
@@ -387,22 +387,19 @@ func txnSSHKeysGenerate(c transaction.TxnCtx) error {
 	// Generate tar_ssh.pem file if not available
 	if _, err := os.Stat(tarSSHPemFile); os.IsNotExist(err) {
 		args = []string{"-N", "", "-f", tarSSHPemFile}
-		_, err = exec.Command("ssh-keygen", args...).Output()
+		_, err = utils.ExecuteCommandOutput("ssh-keygen", args...)
 		if err != nil {
 			return err
 		}
 	}
-	data, err = ioutil.ReadFile(tarSSHPemFile + ".pub")
-	if err != nil {
+	if data, err = ioutil.ReadFile(tarSSHPemFile + ".pub"); err != nil {
 		return err
 	}
 	sshkey.TarKey = string(data)
 
 	err = addOrUpdateSSHKey(volname, sshkey)
-	if err != nil {
-		return err
-	}
-	return nil
+
+	return err
 }
 
 func txnSSHKeysPush(c transaction.TxnCtx) error {

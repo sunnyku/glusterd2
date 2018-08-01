@@ -9,7 +9,6 @@ import (
 	"github.com/gluster/glusterd2/glusterd2/transaction"
 	"github.com/gluster/glusterd2/glusterd2/volume"
 	"github.com/gluster/glusterd2/glusterd2/xlator"
-	"github.com/gluster/glusterd2/pkg/api"
 	"github.com/gluster/glusterd2/pkg/errors"
 	bitrotapi "github.com/gluster/glusterd2/plugins/bitrot/api"
 	"github.com/gorilla/mux"
@@ -26,67 +25,68 @@ func bitrotEnableHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := gdctx.GetReqLogger(ctx)
 
+	txn, err := transaction.NewTxnWithLocks(ctx, volName)
+	if err != nil {
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
+		return
+	}
+	defer txn.Done()
+
 	// Validate volume existence
 	volinfo, err := volume.GetVolume(volName)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound, errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
 
 	// Check if volume is started
 	if volinfo.State != volume.VolStarted {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrVolNotStarted.Error(), api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrVolNotStarted)
 		return
 	}
 
 	// Check if bitrot is already enabled
-	if volume.IsBitrotEnabled(volinfo) {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrBitrotAlreadyEnabled.Error(), api.ErrCodeDefault)
+	if isBitrotEnabled(volinfo) {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrBitrotAlreadyEnabled)
 		return
 	}
-
+	//save volume information for transaction failure scenario
+	if err := txn.Ctx.Set("oldvolinfo", volinfo); err != nil {
+		logger.WithError(err).Error("failed to set oldvolinfo in transaction context")
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
 	// Enable bitrot-stub
-	volinfo.Options[volume.VkeyFeaturesBitrot] = "on"
+	volinfo.Options[keyFeaturesBitrot] = "on"
 
 	/* Enable scrubber daemon (bit-rot.so). The same so acts as bitd and scrubber. With "scrubber" on, it behaves as
 	   scrubber othewise bitd */
-	volinfo.Options[volume.VkeyFeaturesScrub] = "true"
-
-	// Transaction which starts bitd and scrubber on all nodes.
-	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
+	volinfo.Options[keyFeaturesScrub] = "true"
 
 	if err := txn.Ctx.Set("volinfo", volinfo); err != nil {
 		logger.WithError(err).Error("failed to set volinfo in transaction context")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
-		return
-	}
-
-	//Lock on Volume Name
-	lock, unlock, err := transaction.CreateLockSteps(volName)
-	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 
 	txn.Nodes = volinfo.Nodes()
 	txn.Steps = []*transaction.Step{
-		lock,
 		{
-			DoFunc: "vol-option.UpdateVolinfo",
-			Nodes:  []uuid.UUID{gdctx.MyUUID},
+			DoFunc:   "vol-option.UpdateVolinfo",
+			UndoFunc: "vol-option.UpdateVolinfo.Undo",
+			Nodes:    []uuid.UUID{gdctx.MyUUID},
 		},
 		{
 			// Required because bitrot-stub should be enabled on brick side
 			DoFunc: "vol-option.NotifyVolfileChange",
 			Nodes:  txn.Nodes,
 		},
-
 		{
 			DoFunc: "bitrot-enable.Commit",
 			Nodes:  txn.Nodes,
 		},
-		unlock,
 	}
 
 	err = txn.Do()
@@ -99,7 +99,7 @@ func bitrotEnableHandler(w http.ResponseWriter, r *http.Request) {
 			"error":   err.Error(),
 			"volname": volName,
 		}).Error("failed to enable bitrot")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 	restutils.SendHTTPResponse(ctx, w, http.StatusOK, "Bitrot enabled successfully")
@@ -113,44 +113,41 @@ func bitrotDisableHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := gdctx.GetReqLogger(ctx)
 
+	txn, err := transaction.NewTxnWithLocks(ctx, volName)
+	if err != nil {
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
+		return
+	}
+	defer txn.Done()
+
 	// Validate volume existence
 	volinfo, err := volume.GetVolume(volName)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound, errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
 
 	// Check if bitrot is already disabled
-	if !volume.IsBitrotEnabled(volinfo) {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrBitrotAlreadyDisabled.Error(), api.ErrCodeDefault)
+	if !isBitrotEnabled(volinfo) {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrBitrotAlreadyDisabled)
 		return
 	}
 
 	// Disable bitrot-stub
-	volinfo.Options[volume.VkeyFeaturesBitrot] = "off"
+	volinfo.Options[keyFeaturesBitrot] = "off"
 	// Disable scrub by updating volinfo Options
-	volinfo.Options[volume.VkeyFeaturesScrub] = "false"
-
-	// Transaction which stop bitd and scrubber on all nodes.
-	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
+	volinfo.Options[keyFeaturesScrub] = "false"
 
 	if err := txn.Ctx.Set("volinfo", volinfo); err != nil {
 		logger.WithError(err).Error("failed to set volinfo in transaction context")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
-		return
-	}
-
-	//Lock on Volume Name
-	lock, unlock, err := transaction.CreateLockSteps(volName)
-	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 
 	txn.Nodes = volinfo.Nodes()
 	txn.Steps = []*transaction.Step{
-		lock,
 		{
 			DoFunc: "vol-option.UpdateVolinfo",
 			Nodes:  []uuid.UUID{gdctx.MyUUID},
@@ -164,7 +161,6 @@ func bitrotDisableHandler(w http.ResponseWriter, r *http.Request) {
 			DoFunc: "bitrot-disable.Commit",
 			Nodes:  txn.Nodes,
 		},
-		unlock,
 	}
 
 	err = txn.Do()
@@ -174,7 +170,7 @@ func bitrotDisableHandler(w http.ResponseWriter, r *http.Request) {
 			"error":   err.Error(),
 			"volname": volName,
 		}).Error("failed to disable bitrot")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -189,44 +185,40 @@ func bitrotScrubOndemandHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := gdctx.GetReqLogger(ctx)
 
+	txn, err := transaction.NewTxnWithLocks(ctx, volName)
+	if err != nil {
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
+		return
+	}
+	defer txn.Done()
+
 	// Validate volume existence
 	volinfo, err := volume.GetVolume(volName)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound, errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
 
 	// Check if volume is started
 	if volinfo.State != volume.VolStarted {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrVolNotStarted.Error(), api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrVolNotStarted)
 		return
 	}
 
 	// Check if bitrot is disabled
-	if !volume.IsBitrotEnabled(volinfo) {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrBitrotNotEnabled.Error(), api.ErrCodeDefault)
-		return
-	}
-
-	// Transaction which starts scrubber on demand.
-	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
-
-	//Lock on Volume Name
-	lock, unlock, err := transaction.CreateLockSteps(volName)
-	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+	if !isBitrotEnabled(volinfo) {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrBitrotNotEnabled)
 		return
 	}
 
 	txn.Nodes = volinfo.Nodes()
 	txn.Steps = []*transaction.Step{
-		lock,
 		{
 			DoFunc: "bitrot-scrubondemand.Commit",
 			Nodes:  txn.Nodes,
 		},
-		unlock,
 	}
 	txn.Ctx.Set("volname", volName)
 
@@ -236,7 +228,7 @@ func bitrotScrubOndemandHandler(w http.ResponseWriter, r *http.Request) {
 			"error":   err.Error(),
 			"volname": volName,
 		}).Error("failed to start scrubber")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 	restutils.SendHTTPResponse(ctx, w, http.StatusOK, "Scrubber started successfully")
@@ -250,37 +242,33 @@ func bitrotScrubStatusHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	logger := gdctx.GetReqLogger(ctx)
 
+	txn, err := transaction.NewTxnWithLocks(ctx, volName)
+	if err != nil {
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
+		return
+	}
+	defer txn.Done()
+
 	// Validate volume existence
 	volinfo, err := volume.GetVolume(volName)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound,
-			errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
 
 	// Check if volume is started
 	if volinfo.State != volume.VolStarted {
 		restutils.SendHTTPError(ctx, w, http.StatusBadRequest,
-			errors.ErrVolNotStarted.Error(), api.ErrCodeDefault)
+			errors.ErrVolNotStarted)
 		return
 	}
 
 	// Check if bitrot is disabled
-	if !volume.IsBitrotEnabled(volinfo) {
+	if !isBitrotEnabled(volinfo) {
 		restutils.SendHTTPError(ctx, w, http.StatusBadRequest,
-			errors.ErrBitrotNotEnabled.Error(), api.ErrCodeDefault)
-		return
-	}
-
-	// Transaction which gets scrubber status.
-	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
-
-	//Lock on Volume Name
-	lock, unlock, err := transaction.CreateLockSteps(volName)
-	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError,
-			err.Error(), api.ErrCodeDefault)
+			errors.ErrBitrotNotEnabled)
 		return
 	}
 
@@ -290,12 +278,10 @@ func bitrotScrubStatusHandler(w http.ResponseWriter, r *http.Request) {
 
 	txn.Nodes = volinfo.Nodes()
 	txn.Steps = []*transaction.Step{
-		lock,
 		{
 			DoFunc: "bitrot-scrubstatus.Commit",
 			Nodes:  txn.Nodes,
 		},
-		unlock,
 	}
 	txn.Ctx.Set("volname", volName)
 
@@ -306,7 +292,7 @@ func bitrotScrubStatusHandler(w http.ResponseWriter, r *http.Request) {
 			"volname": volName,
 		}).Error("failed to get scrubber status")
 		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError,
-			err.Error(), api.ErrCodeDefault)
+			err)
 		return
 	}
 
@@ -315,7 +301,7 @@ func bitrotScrubStatusHandler(w http.ResponseWriter, r *http.Request) {
 		errMsg := "Failed to aggregate scrub status results from multiple nodes."
 		logger.WithField("error", err.Error()).Error("bitrotScrubStatusHandler:" + errMsg)
 		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError,
-			errMsg, api.ErrCodeDefault)
+			errMsg)
 		return
 	}
 	restutils.SendHTTPResponse(ctx, w, http.StatusOK, result)
@@ -329,10 +315,10 @@ func createScrubStatusResp(ctx transaction.TxnCtx, volinfo *volume.Volinfo) (*bi
 	// Fill generic info which are same for each node
 	resp.Volume = volinfo.Name
 	resp.State = "Active (Idle)"
-	resp.Frequency, exists = volinfo.Options[volume.VkeyScrubFrequency]
+	resp.Frequency, exists = volinfo.Options[keyScrubFrequency]
 	if !exists {
 		// If not available in Options, it's not set. Use default value
-		opt, err := xlator.FindOption(volume.VkeyScrubFrequency)
+		opt, err := xlator.FindOption(keyScrubFrequency)
 		if err != nil {
 			log.WithFields(log.Fields{
 				"error":   err.Error(),
@@ -343,10 +329,10 @@ func createScrubStatusResp(ctx transaction.TxnCtx, volinfo *volume.Volinfo) (*bi
 		resp.Frequency = opt.DefaultValue
 	}
 
-	resp.Throttle, exists = volinfo.Options[volume.VkeyScrubThrottle]
+	resp.Throttle, exists = volinfo.Options[keyScrubThrottle]
 	if !exists {
 		// If not available in Options, it's not set. Use default value
-		opt, err := xlator.FindOption(volume.VkeyScrubThrottle)
+		opt, err := xlator.FindOption(keyScrubThrottle)
 		if err != nil {
 			log.WithFields(log.Fields{
 				"error":   err.Error(),

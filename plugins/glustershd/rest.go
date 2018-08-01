@@ -1,190 +1,203 @@
 package glustershd
 
 import (
+	"bytes"
+	"encoding/xml"
+	"fmt"
 	"net/http"
+	"os/exec"
+	"path"
+	"strings"
 
 	"github.com/gluster/glusterd2/glusterd2/gdctx"
 	restutils "github.com/gluster/glusterd2/glusterd2/servers/rest/utils"
 	"github.com/gluster/glusterd2/glusterd2/transaction"
 	"github.com/gluster/glusterd2/glusterd2/volume"
-	"github.com/gluster/glusterd2/pkg/api"
-	"github.com/gluster/glusterd2/pkg/errors"
+	gderrors "github.com/gluster/glusterd2/pkg/errors"
+	glustershdapi "github.com/gluster/glusterd2/plugins/glustershd/api"
 
 	"github.com/gorilla/mux"
-	"github.com/pborman/uuid"
-	log "github.com/sirupsen/logrus"
+	config "github.com/spf13/viper"
 )
 
-func isVolReplicate(vType volume.VolType) bool {
-	if vType == volume.Replicate || vType == volume.Disperse || vType == volume.DistReplicate || vType == volume.DistDisperse {
-		return true
+type healTypes int8
+
+const (
+	indexHeal healTypes = 1 + iota
+	fullHeal
+)
+
+func runGlfshealBin(volname string, args []string) (string, error) {
+	var out bytes.Buffer
+	var buffer bytes.Buffer
+	var healInfoOutput string
+
+	buffer.WriteString(fmt.Sprintf("%s", volname))
+	for _, arg := range args {
+		buffer.WriteString(fmt.Sprintf(" %s", arg))
 	}
 
-	return false
+	args = strings.Fields(buffer.String())
+	path, err := exec.LookPath("glfsheal")
+	if err != nil {
+		return healInfoOutput, err
+	}
+
+	cmd := exec.Command(path, args...)
+	cmd.Stdout = &out
+
+	if err = cmd.Run(); err != nil {
+		return healInfoOutput, err
+	}
+
+	healInfoOutput = out.String()
+
+	return healInfoOutput, nil
 }
 
-func glustershEnableHandler(w http.ResponseWriter, r *http.Request) {
-	// Implement the help logic and send response back as below
+func getHealInfo(volname string, option string) (string, error) {
+	var options []string
+	glusterdSockpath := path.Join(config.GetString("rundir"), "glusterd2.socket")
+	options = append(options, option, "xml", "glusterd-sock", glusterdSockpath)
+
+	return runGlfshealBin(volname, options)
+}
+
+func selfhealInfoHandler(w http.ResponseWriter, r *http.Request) {
+	var option string
 	p := mux.Vars(r)
-	volname := p["name"]
+	volname := p["volname"]
+	if val, ok := p["opts"]; ok {
+		option = val
+	}
 
 	ctx := r.Context()
 	logger := gdctx.GetReqLogger(ctx)
 
-	//validate volume name
-	v, err := volume.GetVolume(volname)
+	txn, err := transaction.NewTxnWithLocks(ctx, volname)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound, errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
-	// Store initial volinfo before changing the HealFlag
-	tmp := *v
-	oldvolinfo := &tmp
+	defer txn.Done()
 
-	// validate volume type
-	if !isVolReplicate(v.Type) {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, "Volume Type not supported", api.ErrCodeDefault)
-		return
-	}
-
-	if v.State != volume.VolStarted {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, "Volume should be in started state.", api.ErrCodeDefault)
-		return
-
-	}
-
-	// Transaction which starts self heal daemon on all nodes with atleast one brick.
-	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
-
-	//Lock on Volume Name
-	lock, unlock, err := transaction.CreateLockSteps(volname)
+	// Validate volume existence
+	volinfo, err := volume.GetVolume(volname)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		if err == gderrors.ErrVolNotFound {
+			logger.WithError(err).WithField(
+				"volname", volname).Debug("volume not found")
+			restutils.SendHTTPError(ctx, w, http.StatusNotFound, err)
+		} else {
+			logger.WithError(err).WithField(
+				"volname", volname).Debug("error occurred while looking for volume")
+			restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
+		}
 		return
 	}
 
-	v.HealEnabled = true
-
-	txn.Nodes = v.Nodes()
-	txn.Steps = []*transaction.Step{
-		lock,
-		{
-			DoFunc:   "vol-option.UpdateVolinfo",
-			Nodes:    []uuid.UUID{gdctx.MyUUID},
-			UndoFunc: "selfheald-undo",
-		},
-		{
-			DoFunc: "selfheal-start",
-			Nodes:  txn.Nodes,
-		},
-		{
-			DoFunc: "vol-option.NotifyVolfileChange",
-			Nodes:  txn.Nodes,
-		},
-		unlock,
-	}
-
-	if err := txn.Ctx.Set("volinfo", v); err != nil {
-		logger.WithError(err).Error("failed to set volinfo in transaction context")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+	// Validate volume type
+	if !isVolReplicate(volinfo.Type) {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, "invalid operation for this volume type")
 		return
 	}
 
-	if err := txn.Ctx.Set("oldvolinfo", oldvolinfo); err != nil {
-		logger.WithError(err).Error("failed to set volinfo in transaction context")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+	// Validate volume state
+	if volinfo.State != volume.VolStarted {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, gderrors.ErrVolNotStarted)
 		return
 	}
-
-	err = txn.Do()
+	healInfoOutput, err := getHealInfo(volname, option)
 	if err != nil {
-		logger.WithError(err).Error("failed to start self heal daemon")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		logger.WithError(err).WithField("volname", volname).Error("heal info operation failed")
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, "heal info operation failed")
 		return
 	}
 
-	restutils.SendHTTPResponse(ctx, w, http.StatusOK, nil)
+	output := []byte(healInfoOutput)
+
+	var info glustershdapi.HealInfo
+	err = xml.Unmarshal(output, &info)
+	if err != nil {
+		logger.WithError(err).Error("Error unmarshalling XML output from heal info command")
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	restutils.SendHTTPResponse(ctx, w, http.StatusOK, &info.Bricks)
+
 }
 
-func glustershDisableHandler(w http.ResponseWriter, r *http.Request) {
-	p := mux.Vars(r)
-	volname := p["name"]
+func selfHealHandler(w http.ResponseWriter, r *http.Request) {
+	// Collect inputs from URL
+	volname := mux.Vars(r)["volname"]
 
 	ctx := r.Context()
 	logger := gdctx.GetReqLogger(ctx)
 
-	//validate volume name
-	v, err := volume.GetVolume(volname)
+	healType := indexHeal
+	if heal, ok := r.URL.Query()["type"]; ok {
+		switch heal[0] {
+		case "index":
+			healType = indexHeal
+		case "full":
+			healType = fullHeal
+		default:
+			restutils.SendHTTPError(ctx, w, http.StatusBadRequest, "heal type can only be either index or full")
+			return
+		}
+	}
+	txn, err := transaction.NewTxnWithLocks(ctx, volname)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound, errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
-	// Store initial volinfo before changing the HealFlag
-	tmp := *v
-	oldvolinfo := &tmp
+	defer txn.Done()
 
-	// validate volume type
-	if !isVolReplicate(v.Type) {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, "Volume Type not supported", api.ErrCodeDefault)
-		return
-	}
-
-	// Transaction which checks if all replicate volumes are stopped before
-	// stopping the self-heal daemon.
-	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
-
-	// Lock on volume name.
-	lock, unlock, err := transaction.CreateLockSteps(volname)
+	// Validate volume existence
+	volinfo, err := volume.GetVolume(volname)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
 
-	v.HealEnabled = false
+	// Check if volume is started
+	if volinfo.State != volume.VolStarted {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, gderrors.ErrVolNotStarted)
+		return
+	}
 
-	txn.Nodes = v.Nodes()
+	// Check if self heal is already enabled
+	if !isHealEnabled(volinfo) {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, "self heal option is disabled for this volume")
+		return
+	}
+
+	if err := txn.Ctx.Set("volinfo", volinfo); err != nil {
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err := txn.Ctx.Set("healType", healType); err != nil {
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
 	txn.Steps = []*transaction.Step{
-		lock,
 		{
-			DoFunc:   "vol-option.UpdateVolinfo",
-			Nodes:    []uuid.UUID{gdctx.MyUUID},
-			UndoFunc: "selfheald-undo",
+			DoFunc: "selfheal.Heal",
+			Nodes:  volinfo.Nodes(),
 		},
-
-		{
-			DoFunc: "selfheal-stop",
-			Nodes:  txn.Nodes,
-		},
-		{
-			DoFunc: "vol-option.NotifyVolfileChange",
-			Nodes:  txn.Nodes,
-		},
-		unlock,
 	}
 
-	if err := txn.Ctx.Set("volinfo", v); err != nil {
-		logger.WithError(err).Error("failed to set volinfo in transaction context")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+	if err = txn.Do(); err != nil {
+		logger.WithError(err).Error("failed to start healing process")
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
-
-	if err := txn.Ctx.Set("oldvolinfo", oldvolinfo); err != nil {
-		logger.WithError(err).Error("failed to set volinfo in transaction context")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
-		return
-	}
-
-	err = txn.Do()
-	if err != nil {
-		logger.WithFields(log.Fields{
-			"error":   err.Error(),
-			"volname": volname,
-		}).Error("failed to stop self heal daemon")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
-		return
-	}
-
 	restutils.SendHTTPResponse(ctx, w, http.StatusOK, nil)
 }

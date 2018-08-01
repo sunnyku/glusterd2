@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/gluster/glusterd2/glusterd2/gdctx"
 	"github.com/gluster/glusterd2/pkg/elasticetcd"
@@ -18,7 +19,10 @@ import (
 )
 
 const (
-	sessionTTL = 30 // used for etcd mutexes and liveness key
+	sessionTTL    = 30 // used for etcd mutexes and liveness key
+	getTimeout    = 5
+	putTimeout    = 5
+	deleteTimeout = 5
 )
 
 var (
@@ -70,11 +74,11 @@ func Close() {
 }
 
 // Destroy closes the GD2 store and deletes the store data dir
-func Destroy() {
+func Destroy(deleteNamespace bool) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	Store.Destroy()
+	Store.Destroy(deleteNamespace)
 	Store = nil
 
 	return
@@ -120,7 +124,7 @@ func (s *GDStore) Close() {
 }
 
 // Destroy closes the store and deletes the store data dir
-func (s *GDStore) Destroy() {
+func (s *GDStore) Destroy(deleteNamespace bool) {
 	if s.ee != nil {
 		s.Close()
 		os.RemoveAll(s.conf.Dir)
@@ -129,9 +133,11 @@ func (s *GDStore) Destroy() {
 
 	// remote store: delete the current namespace using un-namespaced
 	// client and then close the client.
-	_, err := s.Client.Delete(context.Background(), s.namespace, clientv3.WithPrefix())
-	if err != nil {
-		log.WithError(err).Error("failed to delete etcd namespace during remote store destroy")
+	if deleteNamespace {
+		_, err := s.Client.Delete(context.Background(), s.namespace, clientv3.WithPrefix())
+		if err != nil {
+			log.WithError(err).Error("failed to delete etcd namespace during remote store destroy")
+		}
 	}
 	s.Close()
 }
@@ -174,4 +180,38 @@ func newNamespacedStore(oc *clientv3.Client, conf *Config) (*GDStore, error) {
 	}
 
 	return &GDStore{*conf, kv, lease, watcher, session, oc, nil, namespaceKey}, nil
+}
+
+//Get is a wrapper function that calls clientv3.KV.Get with a default timeout if an empty context is passed
+func Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+	var cancel context.CancelFunc
+
+	if ctx == context.TODO() {
+		ctx, cancel = context.WithTimeout(context.Background(), getTimeout*time.Second)
+		defer cancel()
+	}
+
+	return Store.Get(ctx, key, opts...)
+}
+
+//Put is a wrapper function that calls clientv3.KV.Put with a default timeout if an empty context is passed
+func Put(ctx context.Context, key, val string, opts ...clientv3.OpOption) (*clientv3.PutResponse, error) {
+	var cancel context.CancelFunc
+
+	if ctx == context.TODO() {
+		ctx, cancel = context.WithTimeout(context.Background(), putTimeout*time.Second)
+		defer cancel()
+	}
+	return Store.Put(ctx, key, val, opts...)
+}
+
+//Delete is a wrapper function that calls clientv3.KV.Delete with a default timeout if an empty context is passed
+func Delete(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.DeleteResponse, error) {
+	var cancel context.CancelFunc
+
+	if ctx == context.TODO() {
+		ctx, cancel = context.WithTimeout(context.Background(), deleteTimeout*time.Second)
+		defer cancel()
+	}
+	return Store.Delete(ctx, key, opts...)
 }

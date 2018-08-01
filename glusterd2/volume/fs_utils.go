@@ -88,24 +88,25 @@ func UsageInfo(volname string) (*SizeInfo, error) {
 
 	if fstat.Type != fuseSuperMagic {
 		// Do a crude check if mountpoint is a glusterfs mount
-		return nil, errors.New("Not FUSE mount")
+		return nil, errors.New("not FUSE mount")
 	}
 
 	return createSizeInfo(&fstat), nil
 }
 
-type mntent struct {
-	fsName  string
-	mntDir  string
-	mntType string
-	mntOpts string
+//Mntent is used to reprsent a state of a mount entry in mtab
+type Mntent struct {
+	FsName  string
+	MntDir  string
+	MntType string
+	MntOpts string
 	// excluded mnt_freq and mnt_passno
 }
 
 // See `man getmntent`
 var mtabReplacer = strings.NewReplacer("\\040", " ", "\\011", "\t", "\\012", "\n", "\\134", "\\")
 
-func readMountEntry(entry string) *mntent {
+func readMountEntry(entry string) *Mntent {
 	f := strings.Fields(entry)
 	if len(f) != 6 {
 		return nil
@@ -115,22 +116,23 @@ func readMountEntry(entry string) *mntent {
 		f[i] = mtabReplacer.Replace(f[i])
 	}
 
-	return &mntent{
-		fsName:  f[0],
-		mntDir:  f[1],
-		mntType: f[2],
-		mntOpts: f[3],
+	return &Mntent{
+		FsName:  f[0],
+		MntDir:  f[1],
+		MntType: f[2],
+		MntOpts: f[3],
 	}
 }
 
-func getMounts() ([]*mntent, error) {
+//GetMounts returns all the mount point entries from /proc/mounts
+func GetMounts() ([]*Mntent, error) {
 
 	content, err := ioutil.ReadFile("/proc/mounts")
 	if err != nil {
 		return nil, err
 	}
 
-	var l []*mntent
+	var l []*Mntent
 
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	for scanner.Scan() {

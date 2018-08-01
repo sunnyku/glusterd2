@@ -3,7 +3,8 @@ package glustershd
 import (
 	"github.com/gluster/glusterd2/glusterd2/servers/rest/route"
 	"github.com/gluster/glusterd2/glusterd2/transaction"
-	"github.com/gluster/glusterd2/pkg/sunrpc"
+	"github.com/gluster/glusterd2/pkg/utils"
+	glustershdapi "github.com/gluster/glusterd2/plugins/glustershd/api"
 )
 
 // Plugin is a structure which implements GlusterdPlugin interface
@@ -15,33 +16,34 @@ func (p *Plugin) Name() string {
 	return "glustershd"
 }
 
-// SunRPCProgram returns sunrpc program to register with Glusterd
-func (p *Plugin) SunRPCProgram() sunrpc.Program {
-	return nil
-}
-
 // RestRoutes returns list of REST API routes to register with Glusterd
 func (p *Plugin) RestRoutes() route.Routes {
 	return route.Routes{
 		route.Route{
-			Name:        "GlustershEnable",
-			Method:      "POST",
-			Pattern:     "/volumes/{name}/heal/enable",
-			Version:     1,
-			HandlerFunc: glustershEnableHandler},
+			Name:         "SelfHealInfo",
+			Method:       "GET",
+			Pattern:      "/volumes/{volname}/{opts}/heal-info",
+			Version:      1,
+			ResponseType: utils.GetTypeString(([]glustershdapi.BrickHealInfo)(nil)),
+			HandlerFunc:  selfhealInfoHandler},
 		route.Route{
-			Name:        "GlustershDisable",
+			Name:         "SelfHealInfo2",
+			Method:       "GET",
+			Pattern:      "/volumes/{volname}/heal-info",
+			Version:      1,
+			ResponseType: utils.GetTypeString(([]glustershdapi.BrickHealInfo)(nil)),
+			HandlerFunc:  selfhealInfoHandler},
+		route.Route{
+			Name:        "SelfHeal",
 			Method:      "POST",
-			Pattern:     "/volumes/{name}/heal/disable",
+			Pattern:     "/volumes/{volname}/heal",
 			Version:     1,
-			HandlerFunc: glustershDisableHandler},
+			HandlerFunc: selfHealHandler},
 	}
 }
 
 // RegisterStepFuncs registers transaction step functions with
 // Glusterd Transaction framework
 func (p *Plugin) RegisterStepFuncs() {
-	transaction.RegisterStepFunc(txnSelfHealStart, "selfheal-start")
-	transaction.RegisterStepFunc(txnSelfHealdUndo, "selfheald-undo")
-	transaction.RegisterStepFunc(txnSelfHealStop, "selfheal-stop")
+	transaction.RegisterStepFunc(txnSelfHeal, "selfheal.Heal")
 }

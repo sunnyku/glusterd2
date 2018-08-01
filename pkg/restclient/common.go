@@ -11,42 +11,55 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gluster/glusterd2/pkg/api"
-
 	"github.com/dgrijalva/jwt-go"
 )
 
-var (
-	expireSeconds = 120
+const (
+	expireSeconds        = 120
+	defaultClientTimeout = 30 // in seconds
 )
 
 // Client represents Glusterd2 REST Client
 type Client struct {
-	baseURL  string
-	username string
-	password string
-	cacert   string
-	insecure bool
+	baseURL     string
+	username    string
+	password    string
+	cacert      string
+	insecure    bool
+	timeout     time.Duration
+	lastRespErr *http.Response
+}
+
+// LastErrorResponse returns the last error response received by this
+// client from glusterd2. Please note that the Body of the response has
+// been read and drained.
+func (c *Client) LastErrorResponse() *http.Response {
+	return c.lastRespErr
+}
+
+// SetTimeout sets the overall client timeout which includes the time taken
+// from setting up TCP connection till client finishes reading the response
+// body.
+func (c *Client) SetTimeout(timeout time.Duration) {
+	c.timeout = timeout
 }
 
 // New creates new instance of Glusterd REST Client
 func New(baseURL string, username string, password string, cacert string, insecure bool) *Client {
-	return &Client{baseURL, username, password, cacert, insecure}
-}
-
-func parseHTTPError(jsonData []byte) string {
-	var errstr api.HTTPError
-	err := json.Unmarshal(jsonData, &errstr)
-	if err != nil {
-		return ""
+	return &Client{
+		baseURL:  baseURL,
+		username: username,
+		password: password,
+		cacert:   cacert,
+		insecure: insecure,
+		timeout:  defaultClientTimeout * time.Second,
 	}
-	return errstr.Error
 }
 
 func getAuthToken(username string, password string) string {
 	// Create the Claims
 	claims := &jwt.StandardClaims{
-		ExpiresAt: time.Now().Add(time.Second * time.Duration(expireSeconds)).Unix(),
+		ExpiresAt: time.Now().Add(time.Second * expireSeconds).Unix(),
 		Issuer:    username,
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -74,12 +87,12 @@ func (c *Client) del(url string, data interface{}, expectStatusCode int, output 
 	return c.do("DELETE", url, data, expectStatusCode, output)
 }
 
-func (c *Client) do(method string, url string, data interface{}, expectStatusCode int, output interface{}) error {
+func (c *Client) do(method string, url string, input interface{}, expectStatusCode int, output interface{}) error {
 	url = fmt.Sprintf("%s%s", c.baseURL, url)
 
 	var body io.Reader
-	if data != nil {
-		reqBody, marshalErr := json.Marshal(data)
+	if input != nil {
+		reqBody, marshalErr := json.Marshal(input)
 		if marshalErr != nil {
 			return marshalErr
 		}
@@ -92,6 +105,7 @@ func (c *Client) do(method string, url string, data interface{}, expectStatusCod
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+	req.Close = true
 
 	// Set Authorization if username and password is not empty string
 	if c.username != "" && c.password != "" {
@@ -99,9 +113,8 @@ func (c *Client) do(method string, url string, data interface{}, expectStatusCod
 	}
 
 	tr := &http.Transport{
-		DisableCompression:    true,
-		DisableKeepAlives:     true,
-		ResponseHeaderTimeout: 3 * time.Second,
+		DisableCompression: true,
+		DisableKeepAlives:  true,
 	}
 
 	if c.cacert != "" || c.insecure {
@@ -119,25 +132,40 @@ func (c *Client) do(method string, url string, data interface{}, expectStatusCod
 		}
 	}
 
-	client := &http.Client{Transport: tr}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   c.timeout,
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-
 	defer resp.Body.Close()
-	outputRaw, err := ioutil.ReadAll(resp.Body)
+
+	if resp.StatusCode != expectStatusCode {
+		// FIXME: We should may be rather look for 4xx or 5xx series
+		// to determine that we got an error response instead of
+		// comparing to what's expected ?
+		c.lastRespErr = resp
+		return newHTTPErrorResponse(resp)
+	}
+
+	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != expectStatusCode {
-		return &UnexpectedStatusError{"Unexpected Status", expectStatusCode, resp.StatusCode, parseHTTPError(outputRaw)}
-	}
 
+	// If a response struct is specified, unmarshall the json response
+	// body into the response struct provided.
 	if output != nil {
-		return json.Unmarshal(outputRaw, output)
+		return json.Unmarshal(b, output)
 	}
 
 	return nil
+}
+
+//Ping checks glusterd2 service status
+func (c *Client) Ping() error {
+	return c.get("/ping", nil, http.StatusOK, nil)
 }

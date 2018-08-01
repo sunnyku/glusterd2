@@ -1,6 +1,7 @@
 package volumecommands
 
 import (
+	"io"
 	"net/http"
 
 	"github.com/gluster/glusterd2/glusterd2/events"
@@ -12,28 +13,28 @@ import (
 	"github.com/gluster/glusterd2/pkg/errors"
 
 	"github.com/gorilla/mux"
+	"github.com/pborman/uuid"
 	log "github.com/sirupsen/logrus"
 )
 
 func startAllBricks(c transaction.TxnCtx) error {
-	var volname string
-	if err := c.Get("volname", &volname); err != nil {
+
+	var volinfo volume.Volinfo
+	if err := c.Get("volinfo", &volinfo); err != nil {
 		return err
 	}
 
-	vol, err := volume.GetVolume(volname)
-	if err != nil {
-		return err
-	}
-
-	for _, b := range vol.GetLocalBricks() {
+	for _, b := range volinfo.GetLocalBricks() {
 
 		c.Logger().WithFields(log.Fields{
 			"volume": b.VolumeName,
 			"brick":  b.String(),
 		}).Info("Starting brick")
 
-		if err := b.StartBrick(); err != nil {
+		if err := b.StartBrick(c.Logger()); err != nil {
+			if err == errors.ErrProcessAlreadyRunning {
+				continue
+			}
 			return err
 		}
 	}
@@ -42,33 +43,19 @@ func startAllBricks(c transaction.TxnCtx) error {
 }
 
 func stopAllBricks(c transaction.TxnCtx) error {
-	var volname string
-	if e := c.Get("volname", &volname); e != nil {
-		c.Logger().WithFields(log.Fields{
-			"error": e,
-			"key":   "volname",
-		}).Error("failed to get value for key from context")
-		return e
+
+	var volinfo volume.Volinfo
+	if err := c.Get("volinfo", &volinfo); err != nil {
+		return err
 	}
 
-	vol, e := volume.GetVolume(volname)
-	if e != nil {
-		// this shouldn't happen
-		c.Logger().WithFields(log.Fields{
-			"error":   e,
-			"volname": volname,
-		}).Error("failed to get volinfo for volume")
-		return e
-	}
-
-	for _, b := range vol.GetLocalBricks() {
-
+	for _, b := range volinfo.GetLocalBricks() {
 		c.Logger().WithFields(log.Fields{
 			"volume": b.VolumeName,
 			"brick":  b.String(),
 		}).Info("volume start failed, stopping brick")
 
-		if err := b.StopBrick(); err != nil {
+		if err := b.StopBrick(c.Logger()); err != nil {
 			return err
 		}
 	}
@@ -77,64 +64,84 @@ func stopAllBricks(c transaction.TxnCtx) error {
 }
 
 func registerVolStartStepFuncs() {
-	transaction.RegisterStepFunc(startAllBricks, "vol-start.Commit")
-	transaction.RegisterStepFunc(stopAllBricks, "vol-start.Undo")
+	transaction.RegisterStepFunc(startAllBricks, "vol-start.StartBricks")
+	transaction.RegisterStepFunc(stopAllBricks, "vol-start.StartBricksUndo")
+	transaction.RegisterStepFunc(storeVolume, "vol-start.UpdateVolinfo")
+	transaction.RegisterStepFunc(undoStoreVolume, "vol-start.UpdateVolinfo.Undo")
 }
 
 func volumeStartHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	logger := gdctx.GetReqLogger(ctx)
-
 	volname := mux.Vars(r)["volname"]
-	vol, e := volume.GetVolume(volname)
-	if e != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound, errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
-		return
-	}
-	if vol.State == volume.VolStarted {
-		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrVolAlreadyStarted.Error(), api.ErrCodeDefault)
+	var req api.VolumeStartReq
+
+	// request body is optional
+	if err := restutils.UnmarshalRequest(r, &req); err != nil && err != io.EOF {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, err)
 		return
 	}
 
-	// A simple one-step transaction to start the brick processes
-	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
-	lock, unlock, err := transaction.CreateLockSteps(volname)
+	txn, err := transaction.NewTxnWithLocks(ctx, volname)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
+		return
+	}
+	defer txn.Done()
+
+	volinfo, err := volume.GetVolume(volname)
+	if err != nil {
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
+		return
+	}
+
+	if volinfo.State == volume.VolStarted && !req.ForceStartBricks {
+		restutils.SendHTTPError(ctx, w, http.StatusBadRequest, errors.ErrVolAlreadyStarted)
 		return
 	}
 
 	txn.Steps = []*transaction.Step{
-		lock,
 		{
-			DoFunc:   "vol-start.Commit",
-			UndoFunc: "vol-start.Undo",
-			Nodes:    vol.Nodes(),
+			DoFunc:   "vol-start.StartBricks",
+			UndoFunc: "vol-start.StartBricksUndo",
+			Nodes:    volinfo.Nodes(),
 		},
-		unlock,
+		{
+			DoFunc:   "vol-start.UpdateVolinfo",
+			UndoFunc: "vol-start.UpdateVolinfo.Undo",
+			Nodes:    []uuid.UUID{gdctx.MyUUID},
+		},
 	}
-	txn.Ctx.Set("volname", volname)
 
-	err = txn.Do()
-	if err != nil {
-		logger.WithFields(log.Fields{
-			"error":  err.Error(),
-			"volume": volname,
-		}).Error("failed to start volume")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+	if err := txn.Ctx.Set("oldvolinfo", volinfo); err != nil {
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 
-	vol.State = volume.VolStarted
+	volinfo.State = volume.VolStarted
 
-	e = volume.AddOrUpdateVolumeFunc(vol)
-	if e != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, e.Error(), api.ErrCodeDefault)
+	if err := txn.Ctx.Set("volinfo", volinfo); err != nil {
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 
-	events.Broadcast(newVolumeEvent(eventVolumeStarted, vol))
-	restutils.SendHTTPResponse(ctx, w, http.StatusOK, vol)
+	if err := txn.Do(); err != nil {
+		logger.WithError(err).WithField(
+			"volume", volname).Error("transaction to start volume failed")
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
+		return
+	}
+
+	logger.WithField("volume-name", volinfo.Name).Info("volume started")
+	events.Broadcast(volume.NewEvent(volume.EventVolumeStarted, volinfo))
+
+	resp := createVolumeStartResp(volinfo)
+	restutils.SendHTTPResponse(ctx, w, http.StatusOK, resp)
+}
+
+func createVolumeStartResp(v *volume.Volinfo) *api.VolumeStartResp {
+	return (*api.VolumeStartResp)(volume.CreateVolumeInfoResp(v))
 }

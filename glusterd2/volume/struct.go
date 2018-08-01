@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/gluster/glusterd2/glusterd2/brick"
 	"github.com/gluster/glusterd2/glusterd2/gdctx"
@@ -28,22 +29,6 @@ const (
 	VolStarted
 	// VolStopped should be set only for volumes that are not running, excluding newly created volumes
 	VolStopped
-)
-
-const (
-	// VkeyFeaturesQuota is the key to check if quota is disabled or enabled
-	VkeyFeaturesQuota = "features.quota"
-)
-
-const (
-	// VkeyFeaturesBitrot is the key which enables/disables bitrot-stub
-	VkeyFeaturesBitrot = "bitrot-stub.bitrot"
-	// VkeyFeaturesScrub is the key which controls bit-rot.so to be scrubber/bitd
-	VkeyFeaturesScrub = "bit-rot.scrubber"
-	// VkeyScrubFrequency is the key for scrubber frequency
-	VkeyScrubFrequency = "bit-rot.scrub-freq"
-	// VkeyScrubThrottle is the key for controls scrubber throttle
-	VkeyScrubThrottle = "bit-rot.scrub-throttle"
 )
 
 var (
@@ -96,19 +81,21 @@ type Subvol struct {
 
 // Volinfo repesents a volume
 type Volinfo struct {
-	ID          uuid.UUID
-	Name        string
-	Type        VolType
-	Transport   string
-	DistCount   int
-	Options     map[string]string
-	State       VolState
-	Checksum    uint64
-	Version     uint64
-	Subvols     []Subvol
-	Auth        VolAuth // TODO: should not be returned to client
-	GraphMap    map[string]string
-	HealEnabled bool
+	ID        uuid.UUID
+	Name      string
+	VolfileID string
+	Type      VolType
+	Transport string
+	DistCount int
+	Options   map[string]string
+	State     VolState
+	Checksum  uint64
+	Version   uint64
+	Subvols   []Subvol
+	Auth      VolAuth
+	GraphMap  map[string]string
+	Metadata  map[string]string
+	SnapList  []string
 }
 
 // VolAuth represents username and password used by trusted/internal clients
@@ -142,17 +129,17 @@ func NewBrickEntries(bricks []api.BrickReq, volName string, volID uuid.UUID) ([]
 	var binfo brick.Brickinfo
 
 	for _, b := range bricks {
-		u := uuid.Parse(b.NodeID)
+		u := uuid.Parse(b.PeerID)
 		if u == nil {
-			return nil, errors.New("Invalid UUID specified as host for brick")
+			return nil, errors.New("invalid UUID specified as host for brick")
 		}
 
-		p, e := peer.GetPeerF(b.NodeID)
+		p, e := peer.GetPeerF(b.PeerID)
 		if e != nil {
 			return nil, e
 		}
 
-		binfo.NodeID = u
+		binfo.PeerID = u
 		// TODO: Have a better way to select peer address here
 		binfo.Hostname, _, _ = net.SplitHostPort(p.PeerAddresses[0])
 
@@ -172,6 +159,16 @@ func NewBrickEntries(bricks []api.BrickReq, volName string, volID uuid.UUID) ([]
 		binfo.VolumeName = volName
 		binfo.VolumeID = volID
 		binfo.ID = uuid.NewRandom()
+
+		// Auto provisioned bricks
+		if b.VgName != "" && b.LvName != "" {
+			binfo.MountInfo = brick.MountInfo{
+				Mountdir:   b.Mountdir,
+				DevicePath: b.DevicePath,
+				FsType:     b.FsType,
+				MntOpts:    b.MntOpts,
+			}
+		}
 
 		brickInfos = append(brickInfos, binfo)
 	}
@@ -194,7 +191,7 @@ func (v *Volinfo) getBricks(onlyLocal bool) []brick.Brickinfo {
 
 	for _, subvol := range v.Subvols {
 		for _, b := range subvol.Bricks {
-			if onlyLocal && !uuid.Equal(b.NodeID, gdctx.MyUUID) {
+			if onlyLocal && !uuid.Equal(b.PeerID, gdctx.MyUUID) {
 				continue
 			}
 			bricks = append(bricks, b)
@@ -223,14 +220,14 @@ func (v *Volinfo) Nodes() []uuid.UUID {
 		// Add node to the slice only if it isn't present already
 		present = false
 		for _, n := range nodes {
-			if uuid.Equal(b.NodeID, n) == true {
+			if uuid.Equal(b.PeerID, n) == true {
 				present = true
 				break
 			}
 		}
 
 		if present == false {
-			nodes = append(nodes, b.NodeID)
+			nodes = append(nodes, b.PeerID)
 		}
 	}
 
@@ -252,7 +249,7 @@ func (v *Volinfo) Peers() []*peer.Peer {
 
 	resultDict := make(map[string]*peer.Peer)
 	for _, b := range v.GetBricks() {
-		resultDict[b.NodeID.String()] = pDict[b.NodeID.String()]
+		resultDict[b.PeerID.String()] = pDict[b.PeerID.String()]
 	}
 
 	var peers []*peer.Peer
@@ -273,5 +270,28 @@ func SubvolTypeToString(subvolType SubvolType) string {
 	default:
 		return "distribute"
 	}
-	return ""
+}
+
+// MetadataSize returns the size of the volume metadata in Volume info
+func (v *Volinfo) MetadataSize() int {
+	size := 0
+	for key, value := range v.Metadata {
+		if !strings.HasPrefix(key, "_") {
+			size = size + len(key) + len(value)
+		}
+	}
+	return size
+}
+
+// GetLocalBricks returns a list of local Bricks
+func (sv *Subvol) GetLocalBricks() []brick.Brickinfo {
+	var bricks []brick.Brickinfo
+
+	for _, b := range sv.Bricks {
+		if !uuid.Equal(b.PeerID, gdctx.MyUUID) {
+			continue
+		}
+		bricks = append(bricks, b)
+	}
+	return bricks
 }

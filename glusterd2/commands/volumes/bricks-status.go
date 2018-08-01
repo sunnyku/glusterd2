@@ -9,7 +9,6 @@ import (
 	"github.com/gluster/glusterd2/glusterd2/transaction"
 	"github.com/gluster/glusterd2/glusterd2/volume"
 	"github.com/gluster/glusterd2/pkg/api"
-	"github.com/gluster/glusterd2/pkg/errors"
 	"github.com/gorilla/mux"
 )
 
@@ -19,24 +18,6 @@ const (
 
 func registerBricksStatusStepFuncs() {
 	transaction.RegisterStepFunc(bricksStatus, "bricks-status.Check")
-}
-
-func createBrickStatusRsp(brickStatuses []brick.Brickstatus) []*api.BrickStatus {
-	var brickStatusesRsp []*api.BrickStatus
-	for _, status := range brickStatuses {
-		s := &api.BrickStatus{
-			Info:      brick.CreateBrickInfo(&status.Info),
-			Online:    status.Online,
-			Pid:       status.Pid,
-			Port:      status.Port,
-			FS:        status.FS,
-			MountOpts: status.MountOpts,
-			Device:    status.Device,
-			Size:      brick.CreateBrickSizeInfo(&status.Size),
-		}
-		brickStatusesRsp = append(brickStatusesRsp, s)
-	}
-	return brickStatusesRsp
 }
 
 func bricksStatus(ctx transaction.TxnCtx) error {
@@ -56,7 +37,7 @@ func bricksStatus(ctx transaction.TxnCtx) error {
 		ctx.Logger().WithError(err).Error("Failed to get brick status information.")
 		return err
 	}
-	brickStatusesRsp := createBrickStatusRsp(brickStatuses)
+	brickStatusesRsp := brick.CreateBrickStatusRsp(brickStatuses)
 	// Store the results in transaction context. This will be consumed by
 	// the node that initiated the transaction.
 	ctx.SetNodeResult(gdctx.MyUUID, brickStatusTxnKey, brickStatusesRsp)
@@ -71,12 +52,13 @@ func volumeBricksStatusHandler(w http.ResponseWriter, r *http.Request) {
 	volname := mux.Vars(r)["volname"]
 	vol, err := volume.GetVolume(volname)
 	if err != nil {
-		restutils.SendHTTPError(ctx, w, http.StatusNotFound, errors.ErrVolNotFound.Error(), api.ErrCodeDefault)
+		status, err := restutils.ErrToStatusCode(err)
+		restutils.SendHTTPError(ctx, w, status, err)
 		return
 	}
 
 	txn := transaction.NewTxn(ctx)
-	defer txn.Cleanup()
+	defer txn.Done()
 	txn.Steps = []*transaction.Step{
 		{
 			DoFunc: "bricks-status.Check",
@@ -92,7 +74,7 @@ func volumeBricksStatusHandler(w http.ResponseWriter, r *http.Request) {
 	err = txn.Do()
 	if err != nil {
 		logger.WithError(err).WithField("volume", volname).Error("Failed to get volume status")
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err.Error(), api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, err)
 		return
 	}
 
@@ -100,7 +82,7 @@ func volumeBricksStatusHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		errMsg := "Failed to aggregate brick status results from multiple nodes."
 		logger.WithField("error", err.Error()).Error("volumeStatusHandler:" + errMsg)
-		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, errMsg, api.ErrCodeDefault)
+		restutils.SendHTTPError(ctx, w, http.StatusInternalServerError, errMsg)
 		return
 	}
 
@@ -110,9 +92,9 @@ func volumeBricksStatusHandler(w http.ResponseWriter, r *http.Request) {
 func createBricksStatusResp(ctx transaction.TxnCtx, vol *volume.Volinfo) (*api.BricksStatusResp, error) {
 
 	// bmap is a map of brick statuses keyed by brick ID
-	bmap := make(map[string]*api.BrickStatus)
+	bmap := make(map[string]api.BrickStatus)
 	for _, b := range vol.GetBricks() {
-		bmap[b.ID.String()] = &api.BrickStatus{
+		bmap[b.ID.String()] = api.BrickStatus{
 			Info: brick.CreateBrickInfo(&b),
 		}
 	}
@@ -128,12 +110,12 @@ func createBricksStatusResp(ctx transaction.TxnCtx, vol *volume.Volinfo) (*api.B
 			continue
 		}
 		for _, b := range tmp {
-			bmap[b.Info.ID.String()] = &b
+			bmap[b.Info.ID.String()] = b
 		}
 	}
 
 	for _, v := range bmap {
-		resp = append(resp, *v)
+		resp = append(resp, v)
 	}
 
 	return &resp, nil

@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gluster/glusterd2/pkg/restclient"
 )
@@ -13,13 +14,14 @@ var (
 	client                       *restclient.Client
 	logWriter                    io.WriteCloser
 	errFailedToConnectToGlusterd = `Failed to connect to glusterd. Please check if
-- Glusterd is running(%s://%s:%d) and reachable from this node.
-- Make sure hostname/IP and Port specified in the command are valid
+- Glusterd is running(%s) and reachable from this node.
+- Make sure Endpoints specified in the command is valid
 `
 )
 
-func initRESTClient(hostname string, cacert string, insecure bool) {
-	client = restclient.New(hostname, "", "", cacert, insecure)
+func initRESTClient(hostname, user, secret, cacert string, insecure bool) {
+	client = restclient.New(hostname, user, secret, cacert, insecure)
+	client.SetTimeout(time.Duration(flagTimeout) * time.Second)
 }
 
 func isConnectionRefusedErr(err error) bool {
@@ -34,25 +36,39 @@ func isNoRouteToHostErr(err error) bool {
 	return strings.Contains(err.Error(), "no route to host")
 }
 
-func handleGlusterdConnectFailure(msg string, err error, https bool, host string, port int, errcode int) {
+func handleGlusterdConnectFailure(msg, endpoints string, err error, errcode int) {
+	if err == nil {
+		return
+	}
+
 	if isConnectionRefusedErr(err) || isNoSuchHostErr(err) || isNoRouteToHostErr(err) {
-		scheme := "http"
-		if https {
-			scheme = "https"
-		}
 		os.Stderr.WriteString(msg + "\n\n")
-		os.Stderr.WriteString(fmt.Sprintf(errFailedToConnectToGlusterd, scheme, flagHostname, flagPort))
+		os.Stderr.WriteString(fmt.Sprintf(errFailedToConnectToGlusterd, endpoints))
 		os.Exit(errcode)
 	}
 }
 
 func failure(msg string, err error, errcode int) {
-	handleGlusterdConnectFailure(msg, err, flagHTTPS, flagHostname, flagPort, errcode)
 
-	// If different error
-	os.Stderr.WriteString(msg + "\n")
+	handleGlusterdConnectFailure(msg, flagEndpoints[0], err, errcode)
+
+	w := os.Stderr
+
+	w.WriteString(msg + "\n")
+
 	if err != nil {
-		os.Stderr.WriteString("\nError: " + err.Error() + "\n")
+		resp := client.LastErrorResponse()
+
+		w.WriteString("\nResponse headers:\n")
+		for k, v := range resp.Header {
+			if strings.HasSuffix(k, "-Id") {
+				w.WriteString(fmt.Sprintf("%s: %s\n", k, v[0]))
+			}
+		}
+
+		w.WriteString("\nResponse body:\n")
+		w.WriteString(fmt.Sprintf("%s\n", err.Error()))
 	}
+
 	os.Exit(errcode)
 }

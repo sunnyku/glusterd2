@@ -24,18 +24,20 @@ GD2CONF_INSTALL = $(DESTDIR)$(SYSCONFDIR)/$(GD2)/$(GD2_CONF)
 
 GD2STATEDIR = $(LOCALSTATEDIR)/$(GD2)
 GD2LOGDIR = $(LOGDIR)/$(GD2)
+GD2RUNDIR = $(RUNDIR)/$(GD2)
 
 DEPENV ?=
 
 PLUGINS ?= yes
 FASTBUILD ?= yes
 
-.PHONY: all build check check-go check-reqs install vendor-update vendor-install verify release check-protoc $(GD2_BIN) $(GD2_BUILD) $(CLI_BIN) $(CLI_BUILD) cli $(GD2_CONF) gd2conf test dist dist-vendor
+.PHONY: all build binaries check check-go check-reqs install vendor-update vendor-install verify release check-protoc $(GD2_BIN) $(GD2_BUILD) $(CLI_BIN) $(CLI_BUILD) cli $(GD2_CONF) gd2conf test dist dist-vendor functest
 
 all: build
 
-build: check-go check-reqs vendor-install $(GD2_BIN) $(CLI_BIN) $(GD2_CONF)
+build: check-go check-reqs vendor-install binaries $(GD2_CONF)
 check: check-go check-reqs check-protoc
+binaries: $(GD2_BIN) $(CLI_BIN)
 
 check-go:
 	@./scripts/check-go.sh
@@ -49,21 +51,21 @@ check-reqs:
 	@./scripts/check-reqs.sh
 	@echo
 
-$(GD2_BIN): $(GD2_BUILD)
+$(GD2_BIN): $(GD2_BUILD) gd2conf
 $(GD2_BUILD):
-	@PLUGINS=$(PLUGINS) FASTBUILD=$(FASTBUILD) ./scripts/build.sh glusterd2
+	@PLUGINS=$(PLUGINS) FASTBUILD=$(FASTBUILD) BASE_PREFIX=$(BASE_PREFIX) ./scripts/build.sh glusterd2
 	@echo
 
 $(CLI_BIN) cli: $(CLI_BUILD)
 $(CLI_BUILD):
-	@FASTBUILD=$(FASTBUILD) ./scripts/build.sh glustercli
+	@FASTBUILD=$(FASTBUILD) GD2_STATE_DIR=$(GD2STATEDIR) ./scripts/build.sh  glustercli
 	@FASTBUILD=$(FASTBUILD) ./scripts/build.sh glustercli/generate_bash_completion
 	@./$(CLI_BASH_COMPLETION_GEN_BIN) $(CLI_BASH_COMPLETION_BUILD)
 	@echo
 
-$(GD2_CONF) gd2conf: $(GD2CONF_BUILD)
-$(GD2CONF_BUILD):
-	@GD2STATEDIR=$(GD2STATEDIR) GD2LOGDIR=$(GD2LOGDIR) $(GD2CONF_BUILDSCRIPT)
+$(GD2_CONF) gd2conf:
+	@GD2=$(GD2) GD2STATEDIR=$(GD2STATEDIR) GD2LOGDIR=$(GD2LOGDIR) \
+		GD2RUNDIR=$(GD2RUNDIR) $(GD2CONF_BUILDSCRIPT)
 
 install:
 	install -D $(GD2_BUILD) $(GD2_INSTALL)
@@ -82,19 +84,17 @@ vendor-install:
 	@$(DEPENV) dep ensure
 	@echo
 
-verify: check-reqs
-	@./scripts/lint-check.sh
-	@gometalinter -D gotype -E gofmt --errors --deadline=5m -j 4 --vendor
+test: check-reqs
+	@./test.sh $(TESTOPTIONS)
 
-test:
-	@go test $$(go list ./... | sed '/e2e/d;/vendor/d')
+functest: check-reqs
 	@go test ./e2e -v -functest
 
 release: build
 	@./scripts/release.sh
 
 dist:
-	@./scripts/dist.sh
+	@DISTDIR=$(DISTDIR) SIGN=$(SIGN) ./scripts/dist.sh
 
 dist-vendor: vendor-install
-	@VENDOR=yes ./scripts/dist.sh
+	@VENDOR=yes DISTDIR=$(DISTDIR) SIGN=$(SIGN) ./scripts/dist.sh

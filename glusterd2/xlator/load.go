@@ -12,12 +12,14 @@ import "C"
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"unsafe"
 
 	"github.com/gluster/glusterd2/glusterd2/xlator/options"
+	"github.com/gluster/glusterd2/pkg/utils"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -60,9 +62,15 @@ func structifyOption(cOpt *C.volume_option_t) *options.Option {
 	opt.DefaultValue = C.GoString(cOpt.default_value)
 	opt.Description = C.GoString(cOpt.description)
 	opt.ValidateType = options.OptionValidateType(cOpt.validate)
-	opt.Flags = uint32(cOpt.flags)
+	opt.Flags = options.OptionFlag(cOpt.flags)
 	opt.SetKey = C.GoString(cOpt.setkey)
 	opt.Level = options.OptionLevel(cOpt.level)
+
+	// For boolean options, default value isn't set in xlator's option
+	// table as glusterfs code treats that case as false by default.
+	if opt.Type == options.OptionTypeBool && opt.DefaultValue == "" {
+		opt.DefaultValue = "off"
+	}
 
 	return &opt
 }
@@ -81,7 +89,6 @@ func loadXlator(xlPath string) (*Xlator, error) {
 	defer C.dlclose(handle)
 
 	xl := new(Xlator)
-	xl.ID = strings.TrimSuffix(filepath.Base(xlPath), filepath.Ext(xlPath))
 
 	xlSym := C.CString("xlator_api")
 	defer C.free(unsafe.Pointer(xlSym))
@@ -89,9 +96,7 @@ func loadXlator(xlPath string) (*Xlator, error) {
 	p := C.dlsym(handle, xlSym)
 	if p != nil {
 		xp := (*C.xlator_api_t)(p)
-		// FIXME: It's named "server-protocol" instead of "server" in server.so
-		//        https://review.gluster.org/18879
-		// xl.ID = C.GoString(xp.identifier)
+		xl.ID = C.GoString(xp.identifier)
 		xl.rawID = uint32(xp.xlator_id)
 		xl.Flags = uint32(xp.flags)
 		for _, k := range xp.op_version {
@@ -105,6 +110,14 @@ func loadXlator(xlPath string) (*Xlator, error) {
 		if p == nil {
 			return xl, nil
 		}
+	}
+
+	if xl.ID == "" {
+		// The xlator ID defaults to name of its .so file unless the
+		// xlator defines 'xlator_api_t' structure which has the
+		// 'identifier' field.
+		xl.ID = strings.TrimSuffix(filepath.Base(xlPath),
+			filepath.Ext(xlPath))
 	}
 
 	soOptions := (*[maxOptions]C.volume_option_t)(p)
@@ -122,22 +135,32 @@ func loadXlator(xlPath string) (*Xlator, error) {
 		xl.Options = append(xl.Options, structifyOption(&option))
 	}
 
+	if vfunc, ok := validationFuncs[xl.ID]; ok {
+		log.WithField("xlator",
+			xl.ID).Info("Registered validation function for xlator")
+		xl.Validate = vfunc
+	}
+
+	if actor, ok := optionActors[xl.ID]; ok {
+		log.WithField("xlator",
+			xl.ID).Debug("Registered option actor for xlator")
+		xl.Actor = actor
+	}
+
 	return xl, nil
 }
 
 func getXlatorsDir() string {
 
-	// glusterfs gets the path to xlator dir from a compile time flag named
-	// 'XLATORDIR' which gets passed through a -D flag to GCC. This isn't
-	// available to external programs via gluster CLI yet. When one or more
-	// versions of gluster are installed from source or otherwise, the
-	// following is the most fool-proof but hacky way to get the xlator dir
-	// location without making assumptions.
+	out, err := utils.ExecuteCommandOutput("glusterfsd", "--print-xlatordir")
 
-	cmd := "strings -d `which glusterfsd` | awk '/glusterfs\\/.*\\/xlator$/'"
-	out, err := exec.Command("sh", "-c", cmd).Output()
 	if err != nil {
-		return ""
+		// fallback to the old hack if https://review.gluster.org/19905 isn't present
+		cmd := "strings -d `command -v glusterfsd` | awk '/glusterfs\\/.*\\/xlator$/'"
+		out, err = utils.ExecuteCommandOutput("sh", "-c", cmd)
+		if err != nil {
+			return ""
+		}
 	}
 
 	return strings.TrimSpace(string(out))
@@ -148,10 +171,10 @@ func getXlatorsDir() string {
 func loadAllXlators() (map[string]*Xlator, error) {
 
 	xlatorsDir := getXlatorsDir()
-
 	if xlatorsDir == "" {
 		return nil, fmt.Errorf("No xlators dir found")
 	}
+	log.WithField("xlatordir", xlatorsDir).Debug("Xlators dir found")
 
 	s, err := os.Stat(xlatorsDir)
 	if err != nil {

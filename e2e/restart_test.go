@@ -13,23 +13,28 @@ import (
 func TestRestart(t *testing.T) {
 	r := require.New(t)
 
+	// set up a cluster w/o glusterd instances for dependencies
+	tc, err := setupCluster()
+	r.NoError(err)
+	defer teardownCluster(tc)
+
 	gd, err := spawnGlusterd("./config/1.toml", true)
 	r.Nil(err)
 	r.True(gd.IsRunning())
 
-	dir, err := ioutil.TempDir("", "")
+	dir, err := ioutil.TempDir(baseLocalStateDir, t.Name())
 	r.Nil(err)
 	defer os.RemoveAll(dir)
 
-	client := initRestclient(gd.ClientAddress)
+	client := initRestclient(gd)
 
 	createReq := api.VolCreateReq{
-		Name: "vol1",
+		Name: formatVolName(t.Name()),
 		Subvols: []api.SubvolReq{
 			{
 				Type: "distribute",
 				Bricks: []api.BrickReq{
-					{NodeID: gd.PeerID(), Path: dir},
+					{PeerID: gd.PeerID(), Path: dir},
 				},
 			},
 		},
@@ -52,7 +57,7 @@ func TestRestart(t *testing.T) {
 }
 
 func getVols(gd *gdProcess, r *require.Assertions) api.VolumeListResp {
-	client := initRestclient(gd.ClientAddress)
+	client := initRestclient(gd)
 	volname := ""
 	vols, err := client.Volumes(volname)
 	r.Nil(err)

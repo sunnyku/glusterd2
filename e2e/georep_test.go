@@ -13,11 +13,11 @@ import (
 func TestGeorepCreateDelete(t *testing.T) {
 	r := require.New(t)
 
-	gds, err := setupCluster("./config/1.toml", "./config/2.toml")
+	tc, err := setupCluster("./config/1.toml", "./config/2.toml")
 	r.Nil(err)
-	defer teardownCluster(gds)
+	defer teardownCluster(tc)
 
-	brickDir, err := ioutil.TempDir("", "TestGeorepCreate")
+	brickDir, err := ioutil.TempDir(baseLocalStateDir, t.Name())
 	r.Nil(err)
 	defer os.RemoveAll(brickDir)
 
@@ -28,17 +28,17 @@ func TestGeorepCreateDelete(t *testing.T) {
 		brickPaths = append(brickPaths, brickPath)
 	}
 
-	client := initRestclient(gds[0].ClientAddress)
+	client := initRestclient(tc.gds[0])
 
-	volname1 := "testvol1"
+	volname := formatVolName(t.Name())
 	reqVol := api.VolCreateReq{
-		Name: volname1,
+		Name: volname,
 		Subvols: []api.SubvolReq{
 			{
 				Type: "distribute",
 				Bricks: []api.BrickReq{
-					{NodeID: gds[0].PeerID(), Path: brickPaths[0]},
-					{NodeID: gds[0].PeerID(), Path: brickPaths[1]},
+					{PeerID: tc.gds[0].PeerID(), Path: brickPaths[0]},
+					{PeerID: tc.gds[0].PeerID(), Path: brickPaths[1]},
 				},
 			},
 		},
@@ -54,8 +54,8 @@ func TestGeorepCreateDelete(t *testing.T) {
 			{
 				Type: "distribute",
 				Bricks: []api.BrickReq{
-					{NodeID: gds[1].PeerID(), Path: brickPaths[2]},
-					{NodeID: gds[1].PeerID(), Path: brickPaths[3]},
+					{PeerID: tc.gds[1].PeerID(), Path: brickPaths[2]},
+					{PeerID: tc.gds[1].PeerID(), Path: brickPaths[3]},
 				},
 			},
 		},
@@ -65,10 +65,10 @@ func TestGeorepCreateDelete(t *testing.T) {
 	r.Nil(err)
 
 	reqGeorep := georepapi.GeorepCreateReq{
-		MasterVol: volname1,
+		MasterVol: volname,
 		RemoteVol: volname2,
 		RemoteHosts: []georepapi.GeorepRemoteHostReq{
-			{NodeID: gds[1].PeerID(), Hostname: gds[1].PeerAddress},
+			{PeerID: tc.gds[1].PeerID(), Hostname: tc.gds[1].PeerAddress},
 		},
 	}
 
@@ -80,7 +80,7 @@ func TestGeorepCreateDelete(t *testing.T) {
 	r.Nil(err)
 
 	// delete volume
-	err = client.VolumeDelete(volname1)
+	err = client.VolumeDelete(volname)
 	r.Nil(err)
 
 	// delete volume
